@@ -75,3 +75,10 @@ CORS 支持： 允许跨域访问，便于前端和移动应用集成。
 无线协议: ESP-NOW, WiFi
 
 软件接口: RESTful Web API
+![a](https://github.com/user-attachments/assets/868ee2a4-4c71-4250-8542-767f4a3d4759)
+![b](https://github.com/user-attachments/assets/546ee916-0401-4166-b055-f98147d6435b)
+
+![c](https://github.com/user-attachments/assets/a14beb83-1c79-4600-bc67-d527bd2087cf)
+
+![d](https://github.com/user-attachments/assets/f9318efa-c8d8-4728-950c-39645d6ee442)
+<img width="1466" height="1107" alt="e" src="https://github.com/user-attachments/assets/6ad15762-6b9a-4e5e-acf2-2525c13a5316" />
