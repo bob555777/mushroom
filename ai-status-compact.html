@@ -1,0 +1,58 @@
+      <!-- AI识别状态板块 - 紧凑版 -->
+        <div class="ai-status-section">
+            <h2 style="text-align: center; margin-bottom: 15px; color: #333;">🤖 AI环境识别</h2>
+
+            <div class="ai-status-compact">
+                <div class="ai-status-header-compact">
+                    <div class="ai-device-info">
+                        <span class="ai-status-badge" id="ai-connection-status">
+                            <span class="status-dot" id="ai-dot"></span>
+                            <span id="ai-connection-text">等待数据</span>
+                        </span>
+                        <span class="ai-device-name" id="ai-device-id">--</span>
+                    </div>
+                </div>
+
+                <div class="ai-data-grid">
+                    <div class="ai-data-item-compact">
+                        <span class="ai-icon">🌱</span>
+                        <div class="ai-data-info">
+                            <span class="ai-data-label">生长阶段</span>
+                            <span class="ai-data-value" id="ai-stage">--</span>
+                        </div>
+                    </div>
+
+                    <div class="ai-data-item-compact">
+                        <span class="ai-icon">❤️</span>
+                        <div class="ai-data-info">
+                            <span class="ai-data-label">健康状况</span>
+                            <span class="ai-data-value" id="ai-health">--</span>
+                        </div>
+                    </div>
+
+                    <div class="ai-data-item-compact">
+                        <span class="ai-icon">📊</span>
+                        <div class="ai-data-info">
+                            <span class="ai-data-label">置信度</span>
+                            <span class="ai-data-value" id="ai-confidence">--%</span>
+                        </div>
+                    </div>
+
+                    <div class="ai-data-item-compact">
+                        <span class="ai-icon">⏱️</span>
+                        <div class="ai-data-info">
+                            <span class="ai-data-label">数据延迟</span>
+                            <span class="ai-data-value" id="ai-data-age">--秒</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="ai-system-info-compact">
+                    <span class="system-label">通信:</span> ESP-NOW
+                    <span class="separator">|</span>
+                    <span class="system-label">摄像头:</span> <span id="ai-camera-model">--</span>
+                    <span class="separator">|</span>
+                    <span class="system-label">固件:</span> <span id="ai-firmware-version">--</span>
+                </div>
+            </div>
+        </div>

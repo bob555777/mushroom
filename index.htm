@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>蘑菇培养室监控系统</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🍄 蘑菇培养室监控系统</h1>
+            <p>实时监测温湿度、CO2数据，确保最佳生长环境</p>
+            <button class="settings-btn" onclick="showSettings()">⚙️ 设置</button>
+        </div>
+
+        <!-- 导航标签栏 -->
+        <div class="navigation-tabs">
+            <button class="tab-btn active" onclick="switchPage('overview')">
+                📊 监控概览
+            </button>
+            <button class="tab-btn" onclick="switchPage('strategies')">
+                🎯 策略管理
+            </button>
+            <button class="tab-btn" onclick="switchPage('history')">
+                📈 历史数据
+            </button>
+        </div>
+
+        <!-- ESP32连接设置 -->
+        <div class="connection-panel">
+            <label for="esp32-ip">ESP32 IP地址:</label>
+            <input type="text" id="esp32-ip" placeholder="192.168.1.100" value="" />
+            <button onclick="connectToESP32()">连接</button>
+            <span id="connection-status">未连接</span>
+            <button onclick="testConnection()">测试连接</button>
+        </div>
+
+        <!-- 页面容器 -->
+        <!-- 监控概览页面 -->
+        <div id="page-overview" class="page-content active">
+        <div class="dashboard">
+            <!-- 培养室1 - SHT30 + CO2 -->
+            <div class="room-card">
+                <h2 id="room1-title">培养室1</h2>
+                <div class="growth-stage" id="room1-stage">孢子萌发/菌丝扩展</div>
+                <div class="sensor-data three-sensors">
+                    <div class="data-item temp">
+                        <div class="data-label">温度</div>
+                        <div class="data-value" id="room1-temp">--</div>
+                        <div class="data-unit">°C</div>
+                        <div class="param-status" id="room1-temp-status"></div>
+                    </div>
+                    <div class="data-item hum">
+                        <div class="data-label">湿度</div>
+                        <div class="data-value" id="room1-hum">--</div>
+                        <div class="data-unit">%</div>
+                        <div class="param-status" id="room1-hum-status"></div>
+                    </div>
+                    <div class="data-item co2">
+                        <div class="data-label">CO₂浓度</div>
+                        <div class="data-value" id="room1-co2">--</div>
+                        <div class="data-unit">ppm</div>
+                        <div class="param-status" id="room1-co2-status"></div>
+                    </div>
+                </div>
+                <div class="ideal-params">
+                    <h3>📊 生长参数表</h3>
+                    <table id="room1-params-table">
+                        <tr>
+                            <th>阶段</th>
+                            <th>温度</th>
+                            <th>湿度</th>
+                            <th>光照</th>
+                            <th>备注</th>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 培养室2 - SCD30 (温度 + 湿度 + CO2) -->
+            <div class="room-card">
+                <h2 id="room2-title">培养室2 (SCD30)</h2>
+                <div class="growth-stage" id="room2-stage">孢子萌发/菌丝扩展</div>
+                <div class="sensor-data three-sensors">
+                    <div class="data-item temp">
+                        <div class="data-label">温度</div>
+                        <div class="data-value" id="room2-temp">--</div>
+                        <div class="data-unit">°C</div>
+                        <div class="param-status" id="room2-temp-status"></div>
+                    </div>
+                    <div class="data-item hum">
+                        <div class="data-label">湿度</div>
+                        <div class="data-value" id="room2-hum">--</div>
+                        <div class="data-unit">%</div>
+                        <div class="param-status" id="room2-hum-status"></div>
+                    </div>
+                    <div class="data-item co2">
+                        <div class="data-label">CO₂浓度</div>
+                        <div class="data-value" id="room2-co2">--</div>
+                        <div class="data-unit">ppm</div>
+                        <div class="param-status" id="room2-co2-status"></div>
+                    </div>
+                </div>
+                <div class="ideal-params">
+                    <h3>📊 生长参数表</h3>
+                    <table id="room2-params-table">
+                        <tr>
+                            <th>阶段</th>
+                            <th>温度</th>
+                            <th>湿度</th>
+                            <th>光照</th>
+                            <th>备注</th>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 培养室3 - SCD30 -->
+            <div class="room-card">
+                <h2 id="room3-title">培养室3 (SCD30)</h2>
+                <div class="growth-stage" id="room3-stage">孢子萌发/菌丝扩展</div>
+                <div class="sensor-data three-sensors">
+                    <div class="data-item temp">
+                        <div class="data-label">温度</div>
+                        <div class="data-value" id="room3-temp">--</div>
+                        <div class="data-unit">°C</div>
+                        <div class="param-status" id="room3-temp-status"></div>
+                    </div>
+                    <div class="data-item hum">
+                        <div class="data-label">湿度</div>
+                        <div class="data-value" id="room3-hum">--</div>
+                        <div class="data-unit">%</div>
+                        <div class="param-status" id="room3-hum-status"></div>
+                    </div>
+                    <div class="data-item co2">
+                        <div class="data-label">CO₂浓度</div>
+                        <div class="data-value" id="room3-co2">--</div>
+                        <div class="data-unit">ppm</div>
+                        <div class="param-status" id="room3-co2-status"></div>
+                    </div>
+                </div>
+                <div class="ideal-params">
+                    <h3>📊 生长参数表</h3>
+                    <table id="room3-params-table">
+                        <tr>
+                            <th>阶段</th>
+                            <th>温度</th>
+                            <th>湿度</th>
+                            <th>光照</th>
+                            <th>备注</th>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- AI识别状态板块 - 紧凑版 -->
+        <div class="ai-status-section">
+            <h2 style="text-align: center; margin-bottom: 15px; color: #333;">🤖 AI环境识别</h2>
+
+            <div class="ai-status-compact">
+                <div class="ai-status-header-compact">
+                    <div class="ai-device-info">
+                        <span class="ai-status-badge" id="ai-connection-status">
+                            <span class="status-dot" id="ai-dot"></span>
+                            <span id="ai-connection-text">等待连接</span>
+                        </span>
+                        <span class="ai-device-name" id="ai-device-id">未知设备</span>
+                    </div>
+                </div>
+
+                <div class="ai-data-grid">
+                    <div class="ai-data-item-compact">
+                        <span class="ai-icon">🌱</span>
+                        <div class="ai-data-info">
+                            <span class="ai-data-label">生长阶段</span>
+                            <span class="ai-data-value" id="ai-stage">未检测</span>
+                        </div>
+                    </div>
+
+                    <div class="ai-data-item-compact">
+                        <span class="ai-icon">❤️</span>
+                        <div class="ai-data-info">
+                            <span class="ai-data-label">健康状况</span>
+                            <span class="ai-data-value" id="ai-health">未检测</span>
+                        </div>
+                    </div>
+
+                    <div class="ai-data-item-compact">
+                        <span class="ai-icon">📊</span>
+                        <div class="ai-data-info">
+                            <span class="ai-data-label">置信度</span>
+                            <span class="ai-data-value" id="ai-confidence">0%</span>
+                        </div>
+                    </div>
+
+                    <div class="ai-data-item-compact">
+                        <span class="ai-icon">⏱️</span>
+                        <div class="ai-data-info">
+                            <span class="ai-data-label">数据延迟</span>
+                            <span class="ai-data-value" id="ai-data-age">0秒</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="ai-system-info-compact">
+                    <span class="system-label">通信:</span> ESP-NOW
+                    <span class="separator">|</span>
+                    <span class="system-label">摄像头型号:</span> <span id="ai-camera-model">未检测</span>
+                    <span class="separator">|</span>
+                    <span class="system-label">固件版本:</span> <span id="ai-firmware-version">未检测</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 通风制冷系统独立功能区 -->
+        <div class="ventilation-section">
+            <!-- 风扇1控制 -->
+            <div class="fan-control-card">
+                <h2>🌪️ 新风进气系统</h2>
+                <div class="fan-status-display">
+                    <div class="fan-indicator-wrapper">
+                        <div class="fan-indicator" id="fan-indicator"></div>
+                        <span class="fan-status-text" id="fan-status">检测中...</span>
+                    </div>
+                </div>
+                <div class="fan-controls">
+                    <div class="control-mode">
+                        <h3>控制模式</h3>
+                        <button
+                            class="fan-btn mode-btn"
+                            id="fan-auto-btn"
+                            onclick="setFanMode('auto')"
+                        >
+                            自动模式
+                        </button>
+                        <button
+                            class="fan-btn mode-btn active"
+                            id="fan-manual-btn"
+                            onclick="setFanMode('manual')"
+                        >
+                            手动模式
+                        </button>
+                    </div>
+                    <div class="control-actions">
+                        <h3>风扇控制</h3>
+                        <button
+                            class="fan-btn action-btn on-btn"
+                            id="fan-on-btn"
+                            onclick="setFanState(true)"
+                            disabled
+                        >
+                            开启风扇
+                        </button>
+                        <button
+                            class="fan-btn action-btn off-btn"
+                            id="fan-off-btn"
+                            onclick="setFanState(false)"
+                            disabled
+                        >
+                            关闭风扇
+                        </button>
+                    </div>
+                </div>
+                <div class="fan-info" id="fan-info">
+                    <small>自动模式由策略管理控制 | 手动模式直接控制</small>
+                </div>
+            </div>
+
+            <!-- 制冷系统控制 -->
+            <div class="fan-control-card">
+                <h2>❄️ 制冷系统控制</h2>
+                <div class="fan-status-display">
+                    <div class="fan-indicator-wrapper">
+                        <div class="fan-indicator" id="cooler-indicator"></div>
+                        <span class="fan-status-text" id="cooler-status">检测中...</span>
+                    </div>
+                </div>
+                <div class="fan-controls">
+                    <div class="control-mode">
+                        <h3>控制模式</h3>
+                        <button
+                            class="fan-btn mode-btn"
+                            id="cooler-auto-btn"
+                            onclick="setCoolerMode('auto')"
+                        >
+                            自动模式
+                        </button>
+                        <button
+                            class="fan-btn mode-btn active"
+                            id="cooler-manual-btn"
+                            onclick="setCoolerMode('manual')"
+                        >
+                            手动模式
+                        </button>
+                    </div>
+                    <div class="control-actions">
+                        <h3>制冷控制</h3>
+                        <button
+                            class="fan-btn action-btn on-btn"
+                            id="cooler-on-btn"
+                            onclick="setCoolerState(true)"
+                            disabled
+                        >
+                            开启制冷
+                        </button>
+                        <button
+                            class="fan-btn action-btn off-btn"
+                            id="cooler-off-btn"
+                            onclick="setCoolerState(false)"
+                            disabled
+                        >
+                            关闭制冷
+                        </button>
+                    </div>
+                </div>
+                <div class="fan-info" id="cooler-info">
+                    <small>自动模式由策略管理控制 | 手动模式直接控制</small>
+                </div>
+            </div>
+
+            <!-- 风扇2控制 -->
+            <div class="fan-control-card">
+                <h2>🌪️ 涡轮负压系统控制</h2>
+                <div class="fan-status-display">
+                    <div class="fan-indicator-wrapper">
+                        <div class="fan-indicator" id="fan2-indicator"></div>
+                        <span class="fan-status-text" id="fan2-status">检测中...</span>
+                    </div>
+                </div>
+                <div class="fan-controls">
+                    <div class="control-mode">
+                        <h3>控制模式</h3>
+                        <button
+                            class="fan-btn mode-btn"
+                            id="fan2-auto-btn"
+                            onclick="setFan2Mode('auto')"
+                        >
+                            自动模式
+                        </button>
+                        <button
+                            class="fan-btn mode-btn active"
+                            id="fan2-manual-btn"
+                            onclick="setFan2Mode('manual')"
+                        >
+                            手动模式
+                        </button>
+                    </div>
+                    <div class="control-actions">
+                        <h3>风扇控制</h3>
+                        <button
+                            class="fan-btn action-btn on-btn"
+                            id="fan2-on-btn"
+                            onclick="setFan2State(true)"
+                            disabled
+                        >
+                            开启风扇
+                        </button>
+                        <button
+                            class="fan-btn action-btn off-btn"
+                            id="fan2-off-btn"
+                            onclick="setFan2State(false)"
+                            disabled
+                        >
+                            关闭风扇
+                        </button>
+                    </div>
+                </div>
+                <div class="fan-info" id="fan2-info">
+                    <small>自动模式由策略管理控制 | 手动模式直接控制</small>
+                </div>
+            </div>
+
+            <!-- 光照系统控制 -->
+            <div class="fan-control-card">
+                <h2>💡 光照系统控制</h2>
+                <div class="fan-status-display">
+                    <div class="fan-indicator-wrapper">
+                        <div class="fan-indicator" id="light-indicator"></div>
+                        <span class="fan-status-text" id="light-status">检测中...</span>
+                    </div>
+                </div>
+                <div class="fan-controls">
+                    <div class="control-mode">
+                        <h3>控制模式</h3>
+                        <button
+                            class="fan-btn mode-btn"
+                            id="light-auto-btn"
+                            onclick="setLightMode('auto')"
+                        >
+                            自动模式
+                        </button>
+                        <button
+                            class="fan-btn mode-btn active"
+                            id="light-manual-btn"
+                            onclick="setLightMode('manual')"
+                        >
+                            手动模式
+                        </button>
+                    </div>
+                    <div class="control-actions">
+                        <h3>光照控制</h3>
+                        <button
+                            class="fan-btn action-btn on-btn"
+                            id="light-on-btn"
+                            onclick="setLightState(true)"
+                            disabled
+                        >
+                            开启照明
+                        </button>
+                        <button
+                            class="fan-btn action-btn off-btn"
+                            id="light-off-btn"
+                            onclick="setLightState(false)"
+                            disabled
+                        >
+                            关闭照明
+                        </button>
+                    </div>
+                </div>
+                <div class="fan-info" id="light-info">
+                    <small>自动模式由策略管理控制 | 手动模式直接控制</small>
+                </div>
+            </div>
+
+            <!-- 超声雾化器控制 -->
+            <div class="fan-control-card">
+                <h2>💨 超声雾化器控制</h2>
+                <div class="fan-status-display">
+                    <div class="fan-indicator-wrapper">
+                        <div class="fan-indicator" id="mist-indicator"></div>
+                        <span class="fan-status-text" id="mist-status">检测中...</span>
+                    </div>
+                </div>
+                <div class="fan-controls">
+                    <div class="control-mode">
+                        <h3>控制模式</h3>
+                        <button
+                            class="fan-btn mode-btn"
+                            id="mist-auto-btn"
+                            onclick="setMistMode('auto')"
+                        >
+                            自动模式
+                        </button>
+                        <button
+                            class="fan-btn mode-btn active"
+                            id="mist-manual-btn"
+                            onclick="setMistMode('manual')"
+                        >
+                            手动模式
+                        </button>
+                    </div>
+                    <div class="control-actions">
+                        <h3>雾化控制</h3>
+                        <button
+                            class="fan-btn action-btn on-btn"
+                            id="mist-on-btn"
+                            onclick="setMistState(true)"
+                            disabled
+                        >
+                            开启雾化
+                        </button>
+                        <button
+                            class="fan-btn action-btn off-btn"
+                            id="mist-off-btn"
+                            onclick="setMistState(false)"
+                            disabled
+                        >
+                            关闭雾化
+                        </button>
+                    </div>
+                </div>
+                <div class="fan-info" id="mist-info">
+                    <small>自动模式由策略管理控制 | 手动模式直接控制</small>
+                </div>
+            </div>
+
+            <!-- 环境风扇控制 -->
+            <div class="fan-control-card">
+                <h2>🌿 环境风扇控制</h2>
+                <div class="fan-status-display">
+                    <div class="fan-indicator-wrapper">
+                        <div class="fan-indicator" id="env-fan-indicator"></div>
+                        <span class="fan-status-text" id="env-fan-status">检测中...</span>
+                    </div>
+                </div>
+                <div class="fan-controls">
+                    <div class="control-mode">
+                        <h3>控制模式</h3>
+                        <button
+                            class="fan-btn mode-btn"
+                            id="env-fan-auto-btn"
+                            onclick="setEnvFanMode('auto')"
+                        >
+                            自动模式
+                        </button>
+                        <button
+                            class="fan-btn mode-btn active"
+                            id="env-fan-manual-btn"
+                            onclick="setEnvFanMode('manual')"
+                        >
+                            手动模式
+                        </button>
+                    </div>
+                    <div class="control-actions">
+                        <h3>风扇控制</h3>
+                        <button
+                            class="fan-btn action-btn on-btn"
+                            id="env-fan-on-btn"
+                            onclick="setEnvFanState(true)"
+                            disabled
+                        >
+                            开启风扇
+                        </button>
+                        <button
+                            class="fan-btn action-btn off-btn"
+                            id="env-fan-off-btn"
+                            onclick="setEnvFanState(false)"
+                            disabled
+                        >
+                            关闭风扇
+                        </button>
+                    </div>
+                </div>
+                <div class="fan-info" id="env-fan-info">
+                    <small>自动模式由策略管理控制 | 手动模式直接控制</small>
+                </div>
+            </div>
+        </div>
+        </div>
+        <!-- 监控概览页面结束 -->
+
+        <!-- 策略管理页面 -->
+        <div id="page-strategies" class="page-content">
+        <!-- 策略管理板块 -->
+        <div class="strategy-section">
+            <h2>🎯 策略管理系统</h2>
+
+            <!-- 策略创建/编辑表单 -->
+            <div class="strategy-form-card">
+                <h3 id="strategy-form-title">创建新策略</h3>
+                <form id="strategy-form">
+                    <div class="form-row">
+                        <div class="form-group required">
+                            <label for="strategy-name">策略名称</label>
+                            <input type="text" id="strategy-name" placeholder="输入策略名称" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="strategy-enabled">启用状态</label>
+                            <select id="strategy-enabled">
+                                <option value="true">启用</option>
+                                <option value="false">禁用</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group required">
+                            <label for="trigger-room">培养室</label>
+                            <select id="trigger-room" required>
+                                <option value="room1">培养室1 (SCD30)</option>
+                                <option value="room2">培养室2 (SCD30)</option>
+                                <option value="room3">培养室3 (SCD30)</option>
+                            </select>
+                        </div>
+                        <div class="form-group required">
+                            <label for="trigger-type">触发条件类型</label>
+                            <select id="trigger-type" required>
+                                <option value="temperature">温度</option>
+                                <option value="humidity">湿度</option>
+                                <option value="co2">CO2浓度</option>
+                                <option value="time">时间</option>
+                            </select>
+                        </div>
+                        <div class="form-group required">
+                            <label for="trigger-operator">比较操作符</label>
+                            <select id="trigger-operator" required>
+                                <option value=">">大于 (&gt;)</option>
+                                <option value=">=">大于等于 (&gt;=)</option>
+                                <option value="<">小于 (&lt;)</option>
+                                <option value="<=">小于等于 (&lt;=)</option>
+                                <option value="==">等于 (==)</option>
+                            </select>
+                        </div>
+                        <div class="form-group required">
+                            <label for="trigger-threshold">触发阈值</label>
+                            <input type="number" id="trigger-threshold" step="0.1" placeholder="输入阈值" required>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group required">
+                            <label for="target-device">目标设备</label>
+                            <select id="target-device" required>
+                                <option value="fan1">新风进气系统</option>
+                                <option value="fan2">涡轮负压系统控制</option>
+                                <option value="env_fan">环境风扇</option>
+                                <option value="cooler">制冷系统</option>
+                                <option value="light">光照系统</option>
+                                <option value="mist">超声雾化器</option>
+                            </select>
+                        </div>
+                        <div class="form-group required">
+                            <label for="device-action">执行动作</label>
+                            <select id="device-action" required>
+                                <option value="on">开启</option>
+                                <option value="off">关闭</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary" id="save-strategy-btn">创建策略</button>
+                        <button type="button" class="btn btn-secondary" onclick="resetStrategyForm()">重置</button>
+                        <button type="button" class="btn btn-warning" id="cancel-edit-btn" onclick="cancelEdit()" style="display:none;">取消编辑</button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- 策略列表 -->
+            <div class="strategy-list-card">
+                <h3>当前策略列表</h3>
+                <div class="strategy-controls">
+                    <button class="btn btn-info" onclick="loadStrategies()">🔄 刷新策略</button>
+                    <button class="btn btn-danger" onclick="clearAllStrategies()">🗑️ 清空所有策略</button>
+                </div>
+                <div class="strategy-table-container">
+                    <table class="strategy-table" id="strategy-table">
+                        <thead>
+                            <tr>
+                                <th>策略名称</th>
+                                <th>触发条件</th>
+                                <th>执行动作</th>
+                                <th>状态</th>
+                                <th>最后触发</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="strategy-tbody">
+                            <!-- 策略数据将在这里动态加载 -->
+                        </tbody>
+                    </table>
+                </div>
+                <div class="no-strategies" id="no-strategies" style="display:none;">
+                    <p>暂无策略，请创建新策略</p>
+                </div>
+            </div>
+
+            <!-- 策略执行状态 -->
+            <div class="strategy-status-card">
+                <h3>策略执行状态</h3>
+                <div class="strategy-status-grid">
+                    <div class="status-item">
+                        <span class="status-label">总策略数:</span>
+                        <span class="status-value" id="total-strategies">0</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">启用策略:</span>
+                        <span class="status-value" id="enabled-strategies">0</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">今日触发:</span>
+                        <span class="status-value" id="triggered-today">0</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">最后检查:</span>
+                        <span class="status-value" id="last-check">--</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        </div>
+        <!-- 策略管理页面结束 -->
+
+        <!-- 历史数据页面 -->
+        <div id="page-history" class="page-content">
+        <div class="charts">
+            <h2>📈 历史数据趋势</h2>
+            <div class="chart-container">
+                <canvas id="tempChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="humChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="co2Chart"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="co2Chart2"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="co2Chart3"></canvas>
+            </div>
+        </div>
+        </div>
+        <!-- 历史数据页面结束 -->
+
+        <!-- 全局错误消息和状态栏 -->
+        <div id="error-message" class="error" style="display: none;"></div>
+
+        <div class="status-bar">
+            <div class="update-time" id="update-time">最后更新: --</div>
+            <div>连接状态: <span id="esp32-connection-status">未连接</span></div>
+            <div>系统运行时间: <span id="system-uptime">计算中...</span></div>
+            <div class="fan-status-bar">新风系统: <span id="fan-status-bar">未知</span></div>
+            <div class="fan-status-bar">半导体制冷系统: <span id="cooler-status-bar">未知</span></div>
+            <div class="fan-status-bar">负压排气系统: <span id="fan2-status-bar">未知</span></div>
+            <div class="fan-status-bar">光照系统(G18): <span id="light-status-bar">未知</span></div>
+            <div class="fan-status-bar">超声雾化器(G17): <span id="mist-status-bar">未知</span></div>
+            <div class="fan-status-bar">环境风扇(G7): <span id="env-fan-status-bar">未知</span></div>
+        </div>
+    </div>
+
+    <!-- 设置弹窗 -->
+    <div id="settings-modal" class="modal" style="display: none;">
+        <div class="modal-content">
+            <span class="close" onclick="hideSettings()">&times;</span>
+            <h2>系统设置</h2>
+            <form id="settingsForm">
+                <div class="room-settings">
+                    <h3>培养室1设置 (SCD30)</h3>
+                    <div class="form-group">
+                        <label for="room1_preset">蘑菇品种</label>
+                        <select id="room1_preset" name="room1_preset"></select>
+                    </div>
+                    <div class="form-group">
+                        <label for="room1_stage">生长阶段</label>
+                        <select id="room1_stage" name="room1_stage">
+                            <option value="0">孢子萌发/菌丝扩展</option>
+                            <option value="1">结实诱导（出菇）</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="room-settings">
+                    <h3>培养室2设置 (SCD30)</h3>
+                    <div class="form-group">
+                        <label for="room2_preset">蘑菇品种</label>
+                        <select id="room2_preset" name="room2_preset"></select>
+                    </div>
+                    <div class="form-group">
+                        <label for="room2_stage">生长阶段</label>
+                        <select id="room2_stage" name="room2_stage">
+                            <option value="0">孢子萌发/菌丝扩展</option>
+                            <option value="1">结实诱导（出菇）</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="room-settings">
+                    <h3>培养室3设置 (SCD30)</h3>
+                    <div class="form-group">
+                        <label for="room3_preset">蘑菇品种</label>
+                        <select id="room3_preset" name="room3_preset"></select>
+                    </div>
+                    <div class="form-group">
+                        <label for="room3_stage">生长阶段</label>
+                        <select id="room3_stage" name="room3_stage">
+                            <option value="0">孢子萌发/菌丝扩展</option>
+                            <option value="1">结实诱导（出菇）</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="btn-group">
+                    <button type="submit" class="btn btn-primary">保存设置</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideSettings()">
+                        取消
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

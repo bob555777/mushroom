@@ -1,0 +1,587 @@
+/* ESP32-CAM 蘑菇识别系统
+ * 最终修正版 - 2025/11/09
+ * 目标：
+ * 1. 修复 ESP-NOW MAC 地址中 D3 的声明错误 (已修复)。
+ * 2. 回到 3 参数 run_classifier 简化版本，这是唯一被编译器接受的签名。
+ */
+
+// *** 强制 Arena 大小为 512KB (匹配日志中的成功分配值) ***
+#define EI_CLASSIFIER_TFLITE_ARENA_SIZE 524288
+
+// ( 0 = 动态分配 (Heap/PSRAM), 1 = 静态分配 (Stack/DRAM) )
+#define EI_CLASSIFIER_ALLOCATION_STATIC 1
+
+#include "mushroomV2_inferencing.h"  // 您的 96x96 模型头文件
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include <esp_camera.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <rom/crc.h> 
+#include <freertos/FreeRTOS.h> // for ps_malloc
+
+// ESP-NOW目标设备MAC地址
+uint8_t broadcastAddress[] = {0x30, 0xED, 0xA0, 0x26, 0xD3, 0x1C};
+
+// ESP-NOW数据结构体
+typedef struct {
+  char device_id[32];
+  unsigned long timestamp;
+  char stage[32];
+  float confidence;
+  char health[16];
+  float health_confidence;
+  char camera_model[16];
+  char firmware_version[16];
+  int wifi_rssi;
+  unsigned long free_heap;
+  unsigned long uptime_ms;
+} esp_now_mushroom_data_t;
+
+// 摄像头引脚定义 - ESP32-S3 & OV5640
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      15
+#define SIOD_GPIO_NUM     4
+#define SIOC_GPIO_NUM     5
+#define Y9_GPIO_NUM       16 // D7
+#define Y8_GPIO_NUM       17 // D6
+#define Y7_GPIO_NUM       18 // D5
+#define Y6_GPIO_NUM       12 // D4
+#define Y5_GPIO_NUM       10 // D3
+#define Y4_GPIO_NUM       8  // D2
+#define Y3_GPIO_NUM       9  // D1
+#define Y2_GPIO_NUM       11 // D0
+#define VSYNC_GPIO_NUM    6
+#define HREF_GPIO_NUM     7
+#define PCLK_GPIO_NUM     13
+
+// 图像缓冲参数
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS           96
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           96
+#define EI_CAMERA_FRAME_BYTE_SIZE                 3
+
+// 系统配置
+const int led_pin = 4;
+const unsigned long inference_interval = 30000; // 30秒识别一次
+unsigned long last_inference_time = 0;
+
+// 全局变量
+static bool debug_nn = false;
+static bool is_initialised = false;
+uint8_t *snapshot_buf = nullptr; // 初始化为 nullptr
+bool esp_now_initialized = false;
+
+// *** 张量竞技场 (Tensor Arena) 内存指针 ***
+static uint8_t *ei_model_arena = nullptr;
+
+// 蘑菇状态结构
+struct MushroomStatus {
+  String stage;
+  float confidence;
+  String health;
+  float health_confidence;
+  unsigned long timestamp;
+};
+MushroomStatus current_status;
+
+// 摄像头配置
+static camera_config_t camera_config = {
+    .pin_pwdn = PWDN_GPIO_NUM,
+    .pin_reset = RESET_GPIO_NUM,
+    .pin_xclk = XCLK_GPIO_NUM,
+    .pin_sscb_sda = SIOD_GPIO_NUM,
+    .pin_sscb_scl = SIOC_GPIO_NUM,
+    .pin_d7 = Y9_GPIO_NUM,
+    .pin_d6 = Y8_GPIO_NUM,
+    .pin_d5 = Y7_GPIO_NUM,
+    .pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM,
+    .pin_d2 = Y4_GPIO_NUM,
+    .pin_d1 = Y3_GPIO_NUM,
+    .pin_d0 = Y2_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM,
+    .pin_href = HREF_GPIO_NUM,
+    .pin_pclk = PCLK_GPIO_NUM,
+
+    .xclk_freq_hz = 10000000,
+    
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_RGB565,
+    
+    .frame_size = FRAMESIZE_96X96,
+    
+    .jpeg_quality = 0,
+    
+    .fb_count = 2,
+    
+    .fb_location = CAMERA_FB_IN_PSRAM,
+    
+    .grab_mode = CAMERA_GRAB_LATEST,
+};
+
+/* 函数声明 */
+bool ei_camera_init(void);
+void ei_camera_deinit(void);
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
+bool initESPNow(void);
+void parseInferenceResult(const ei_impulse_result_t *result);
+void sendStatusViaESPNow(void);
+bool runMushroomInference(void);
+
+// ESP-NOW发送回调函数 - 签名修正
+void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  Serial.printf("ESP-NOW发送状态: %s\n", status == ESP_NOW_SEND_SUCCESS ? "成功" : "失败");
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    digitalWrite(led_pin, HIGH);
+    delay(100);
+    digitalWrite(led_pin, LOW);
+  }
+}
+
+// 初始化ESP-NOW
+bool initESPNow() {
+  Serial.println("初始化ESP-NOW...");
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  WiFi.begin();
+  delay(500);
+
+  String mac = WiFi.macAddress();
+  int retries = 0;
+  while (mac == "00:00:00:00:00:00" && retries < 10) {
+    delay(500);
+    mac = WiFi.macAddress();
+    retries++;
+    Serial.printf("尝试获取MAC地址... %d/10\n", retries);
+  }
+  
+  if (mac == "00:00:00:00:00:00") {
+    Serial.println("✗ 无法获取有效的MAC地址");
+    return false;
+  }
+  
+  Serial.print("ESP32-CAM MAC地址: ");
+  Serial.println(mac);
+  Serial.printf("目标设备MAC地址: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                broadcastAddress[0], broadcastAddress[1], broadcastAddress[2],
+                broadcastAddress[3], broadcastAddress[4], broadcastAddress[5]);
+  WiFi.disconnect();
+  delay(100);
+  
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("✗ ESP-NOW初始化失败");
+    return false;
+  }
+  Serial.println("✓ ESP-NOW初始化成功");
+  if (esp_now_register_send_cb(OnDataSent) != ESP_OK) {
+    Serial.println("✗ 注册发送回调失败");
+    return false;
+  }
+  Serial.println("✓ 发送回调注册成功");
+  
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+  if (esp_now_is_peer_exist(broadcastAddress)) {
+    Serial.println("⚠️ 对等设备已存在，先删除");
+    esp_now_del_peer(broadcastAddress);
+    delay(100);
+  }
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("✗ 添加ESP-NOW对等设备失败");
+    return false;
+  }
+  
+  Serial.println("✓ 对等设备添加成功");
+  Serial.println("✓ ESP-NOW完全初始化成功");
+  return true;
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    
+    Serial.println();
+    Serial.println("=====================================");
+    Serial.println("ESP32-CAM 蘑菇识别系统启动 [ESP-NOW版本]");
+    Serial.println("=====================================");
+    Serial.printf("启动时可用堆内存: %d 字节\n", ESP.getFreeHeap());
+    Serial.printf("启动时可用PSRAM: %d 字节\n", ESP.getFreePsram());
+    
+    pinMode(led_pin, OUTPUT);
+    digitalWrite(led_pin, LOW);
+    Serial.println("LED状态指示灯初始化完成 (GPIO 4)");
+    const int flash_disable_pin = 4;
+    pinMode(flash_disable_pin, OUTPUT);
+    digitalWrite(flash_disable_pin, LOW);
+    Serial.println("硬件闪光灯控制引脚已禁用");
+    
+    // 初始化 ESP-NOW
+    Serial.println("\n开始初始化ESP-NOW...");
+    delay(1000);
+    if (!initESPNow()) {
+        Serial.println("✗ ESP-NOW初始化失败！");
+        Serial.println("系统将继续运行，但无法发送数据");
+        esp_now_initialized = false;
+        for (int i = 0; i < 10; i++) {
+            digitalWrite(led_pin, HIGH);
+            delay(100);
+            digitalWrite(led_pin, LOW);
+            delay(100);
+        }
+    } else {
+        Serial.println("✓ ESP-NOW初始化完成");
+        esp_now_initialized = true;
+        digitalWrite(led_pin, HIGH);
+        delay(1000);
+    }
+    
+    // *** 关键新增: 强制分配张量竞技场到 PSRAM ***
+    Serial.println("\n开始分配张量竞技场...");
+    ei_model_arena = (uint8_t*)ps_malloc(EI_CLASSIFIER_TFLITE_ARENA_SIZE);
+    if (ei_model_arena == nullptr) {
+        Serial.printf("✗ 张量竞技场分配失败! (PSRAM不足或已耗尽, 需要 %d 字节)\n", EI_CLASSIFIER_TFLITE_ARENA_SIZE);
+        Serial.println("系统将进入错误循环...");
+        while(true) {
+            digitalWrite(led_pin, !digitalRead(led_pin));
+            delay(250);
+        }
+    }
+    Serial.printf("✓ 张量竞技场分配成功: %d 字节 PSRAM\n", EI_CLASSIFIER_TFLITE_ARENA_SIZE);
+    
+    // 在 Setup 中初始化摄像头
+    Serial.println("\n开始初始化摄像头...");
+    if (ei_camera_init() == false) {
+        Serial.println("✗ 摄像头初始化失败!");
+        while(true) {
+            digitalWrite(led_pin, !digitalRead(led_pin));
+            delay(500);
+        }
+    } else {
+        Serial.println("✓ 摄像头初始化成功");
+    }
+
+    // 在 delay(2000) 之前清空缓冲区
+    Serial.println("正在清空启动缓冲区...");
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) {
+        esp_camera_fb_return(fb);
+        Serial.println("✓ 启动缓冲区已清空");
+    } else {
+        Serial.println("✗ 启动时抓取帧失败");
+    }
+
+    Serial.println("\n系统初始化完成，2秒后开始连续推理...");
+    delay(2000);
+}
+
+void loop() {
+    unsigned long now = millis();
+    if (now - last_inference_time >= inference_interval) {
+        Serial.println("\n=== 开始新的蘑菇识别周期 ===");
+        const int flash_gpio = 4;
+        digitalWrite(flash_gpio, LOW);
+        pinMode(flash_gpio, OUTPUT);
+        digitalWrite(flash_gpio, LOW);
+        
+        digitalWrite(led_pin, LOW);
+        bool inference_success = runMushroomInference();
+        
+        // 处理结果
+        if (inference_success) {
+            Serial.println("识别成功");
+            if (esp_now_initialized) {
+                sendStatusViaESPNow();
+            } else {
+                Serial.println("ESP-NOW未初始化，无法发送数据");
+            }
+        } else {
+            Serial.println("识别失败，等待下次重试");
+        }
+
+        last_inference_time = now;
+        digitalWrite(led_pin, HIGH);
+        digitalWrite(flash_gpio, LOW);
+    }
+    
+    delay(100);
+}
+
+bool runMushroomInference() {
+    // 释放旧的快照缓冲区
+    if (snapshot_buf != nullptr) {
+        free(snapshot_buf);
+        snapshot_buf = nullptr; 
+    }
+    
+    // 分配快照缓冲区
+    snapshot_buf = (uint8_t*)ps_malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
+    if(snapshot_buf == nullptr) {
+        Serial.println("快照缓冲区分配失败! (PSRAM不足或未启用?)");
+        return false;
+    }
+
+    // 构建信号
+    ei::signal_t signal;
+    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    signal.get_data = &ei_camera_get_data;
+    
+    // 捕获图像
+    if (ei_camera_capture(EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS, snapshot_buf) == false) {
+        Serial.println("图像捕获失败");
+        free(snapshot_buf);
+        snapshot_buf = nullptr;
+        return false;
+    }
+
+    // 运行分类器
+    ei_impulse_result_t result = { 0 };
+    
+    // *** 最终修正：回到 3 参数重载，这是唯一被编译器接受的版本 ***
+    // 必须依赖 TFLite Micro 的全局句柄自动使用 PSRAM (ei_model_arena)
+    EI_IMPULSE_ERROR err = run_classifier(
+        &signal, 
+        &result, 
+        debug_nn
+    );
+
+    if (err != EI_IMPULSE_OK) {
+        Serial.printf("分类器运行失败 (%d)\n", err);
+        free(snapshot_buf);
+        snapshot_buf = nullptr;
+        return false;
+    }
+
+    // 解析结果
+    parseInferenceResult(&result);
+    
+    free(snapshot_buf);
+    snapshot_buf = nullptr;
+    return true;
+}
+
+void parseInferenceResult(const ei_impulse_result_t *result) {
+    Serial.println("\n=== 识别结果 ===");
+    Serial.printf("处理时间 (DSP: %d ms, 分类: %d ms, 异常: %d ms)\n",
+                result->timing.dsp, result->timing.classification, result->timing.anomaly);
+    float max_confidence = 0.0f;
+    String best_label = "unknown";
+    
+#if EI_CLASSIFIER_OBJECT_DETECTION == 1
+    // 目标检测结果
+    Serial.println("目标检测边界框:");
+    for (uint32_t i = 0; i < result->bounding_boxes_count; i++) {
+        ei_impulse_result_bounding_box_t bb = result->bounding_boxes[i];
+        if (bb.value == 0) {
+            continue;
+        }
+        Serial.printf("  %s (%.3f) [ x: %u, y: %u, width: %u, height: %u ]\n",
+                bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
+        if (bb.value > max_confidence) {
+            max_confidence = bb.value;
+            best_label = String(bb.label);
+        }
+    }
+#else
+    // 分类结果
+    Serial.println("分类预测:");
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        float confidence = result->classification[i].value;
+        Serial.printf("  %s: %.5f (%.1f%%)\n",
+                     result->classification[i].label,
+                     confidence,
+                     confidence * 100.0f);
+        if (confidence > max_confidence) {
+            max_confidence = confidence;
+            best_label = String(result->classification[i].label);
+        }
+    }
+#endif
+
+    // 异常检测结果
+#if EI_CLASSIFIER_HAS_ANOMALY
+    Serial.printf("异常预测: %.3f\n", result->anomaly);
+#endif
+
+    // 更新当前状态（置信度阈值0.6）
+    if (max_confidence > 0.6f) {
+        current_status.stage = best_label;
+        current_status.confidence = max_confidence;
+        current_status.timestamp = millis();
+        
+        // 健康状态判断
+        if (best_label.indexOf("healthy") >= 0 ||
+            best_label.indexOf("mature") >= 0 ||
+            best_label.indexOf("good") >= 0) {
+            current_status.health = "healthy";
+            current_status.health_confidence = max_confidence;
+        } else if (best_label.indexOf("disease") >= 0 ||
+                   best_label.indexOf("contaminated") >= 0 ||
+                   best_label.indexOf("bad") >= 0 ||
+                   best_label.indexOf("rot") >= 0) {
+           
+            current_status.health = "diseased";
+            current_status.health_confidence = max_confidence;
+        } else {
+            current_status.health = "unknown";
+            current_status.health_confidence = max_confidence;
+        }
+        
+        Serial.printf("\n✓ 识别成功: %s (%.1f%%) - 健康状态: %s\n",
+                      current_status.stage.c_str(),
+                      current_status.confidence * 100.0f,
+                      current_status.health.c_str());
+    } else {
+        Serial.printf("\n✗ 置信度不足: %.1f%% < 60%%\n", max_confidence * 100.0f);
+        current_status.stage = "uncertain";
+        current_status.confidence = max_confidence;
+        current_status.health = "unknown";
+        current_status.health_confidence = 0;
+        current_status.timestamp = millis();
+    }
+}
+
+void sendStatusViaESPNow() {
+    if (!esp_now_initialized) {
+        Serial.println("ESP-NOW未初始化，无法发送数据");
+        return;
+    }
+    
+    esp_now_mushroom_data_t sendData;
+    
+    strncpy(sendData.device_id, "esp32-cam-mushroom", sizeof(sendData.device_id) - 1);
+    sendData.device_id[sizeof(sendData.device_id) - 1] = '\0';
+    sendData.timestamp = current_status.timestamp;
+    strncpy(sendData.stage, current_status.stage.c_str(), sizeof(sendData.stage) - 1);
+    sendData.stage[sizeof(sendData.stage) - 1] = '\0';
+    sendData.confidence = current_status.confidence;
+    strncpy(sendData.health, current_status.health.c_str(), sizeof(sendData.health) - 1);
+    sendData.health[sizeof(sendData.health) - 1] = '\0';
+    sendData.health_confidence = current_status.health_confidence;
+    strncpy(sendData.camera_model, "OV5640", sizeof(sendData.camera_model) - 1);
+    sendData.camera_model[sizeof(sendData.camera_model) - 1] = '\0';
+    strncpy(sendData.firmware_version, "1.0.0-ESPNOW", sizeof(sendData.firmware_version) - 1);
+    sendData.firmware_version[sizeof(sendData.firmware_version) - 1] = '\0';
+    sendData.wifi_rssi = 0;
+    sendData.free_heap = ESP.getFreeHeap();
+    sendData.uptime_ms = millis();
+    
+    Serial.println("通过ESP-NOW发送数据...");
+    Serial.printf("设备ID: %s\n", sendData.device_id);
+    Serial.printf("阶段: %s\n", sendData.stage);
+    Serial.printf("置信度: %.1f%%\n", sendData.confidence * 100);
+    Serial.printf("健康状态: %s\n", sendData.health);
+    
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &sendData, sizeof(sendData));
+    if (result == ESP_OK) {
+        Serial.println("ESP-NOW数据发送成功");
+    } else {
+        Serial.printf("ESP-NOW数据发送失败: %d\n", result);
+    }
+}
+
+bool ei_camera_init(void) {
+    if (is_initialised) return true; // 防止重复初始化
+    const int flash_gpio = 4;
+    pinMode(flash_gpio, OUTPUT);
+    digitalWrite(flash_gpio, LOW);
+
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) {
+        Serial.printf("摄像头初始化失败，错误码: 0x%x\n", err);
+        return false;
+    }
+
+    sensor_t * s = esp_camera_sensor_get();
+    Serial.println("传感器已获取，使用配置默认设置 (96x96, 10MHz, RGB565, LATEST)");
+    is_initialised = true;
+    Serial.println("摄像头初始化完成");
+    return true;
+}
+
+void ei_camera_deinit(void) {
+    // 摄像头现在常开
+}
+
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
+    bool do_resize = false;
+    if (!is_initialised) {
+        Serial.println("摄像头未初始化 (capture)");
+        return false;
+    }
+
+    const int flash_gpio = 4;
+    digitalWrite(flash_gpio, LOW);
+    pinMode(flash_gpio, OUTPUT);
+    digitalWrite(flash_gpio, LOW);
+    delay(10);
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("摄像头捕获失败");
+        return false;
+    }
+
+    // *** 最终修正：使用 fb->format (即 RGB565) ***
+    bool converted = fmt2rgb888(fb->buf, fb->len, fb->format, out_buf);
+    // 立即归还缓冲区
+    esp_camera_fb_return(fb);
+    
+    if(!converted){
+        Serial.println("图像格式转换失败 (RGB565 -> RGB888)");
+        return false;
+    }
+
+    // 检查是否需要缩放 (现在模型、缓冲区和摄像头都是 96x96)
+    if ((img_width != EI_CAMERA_RAW_FRAME_BUFFER_COLS) ||
+        (img_height != EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
+        do_resize = true;
+    }
+
+    if (do_resize) {
+        Serial.println("!!! 图像尺寸不匹配，正在缩放 (这不应该发生) !!!");
+        ei::image::processing::crop_and_interpolate_rgb888(
+            out_buf,
+            EI_CAMERA_RAW_FRAME_BUFFER_COLS,
+            EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
+            out_buf,
+            img_width,
+            img_height);
+    }
+
+    digitalWrite(flash_gpio, LOW);
+    return true;
+}
+
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
+    size_t pixel_ix = offset * 3;
+    size_t pixels_left = length;
+    size_t out_ptr_ix = 0;
+
+    extern uint8_t *snapshot_buf; 
+    
+    while (pixels_left != 0) {
+        // 警告：这里保持了原始代码的非标准位操作逻辑，它将 3 字节 RGB 聚合为一个 float
+        out_ptr[out_ptr_ix] = (float)((snapshot_buf[pixel_ix + 2] << 16) +
+                              (snapshot_buf[pixel_ix + 1] << 8) +
+                              snapshot_buf[pixel_ix]);
+        out_ptr_ix++;
+        pixel_ix += 3; 
+        pixels_left--;
+
+    }
+    
+    return 0;
+}
+
+#if !defined(EI_CLASSIFIER_SENSOR) || \
+    EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_CAMERA
+#error "当前传感器的模型无效"
+#endif
