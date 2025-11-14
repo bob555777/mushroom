@@ -1,0 +1,2879 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <SparkFun_SCD30_Arduino_Library.h>
+#include <esp_now.h>
+
+// WiFi配置
+const char* ssid = "wifi名称";
+const char* password = "000000000";
+
+// ESP-NOW配置
+uint8_t esp32cam_mac[] = {0xC0, 0xCD, 0xD6, 0xCF, 0xA9, 0xFC}; // ESP32-CAM的MAC地址，需要替换
+
+// 培养室1 SCD30传感器配置
+#define SCD30_SDA_PIN_1 8    // 培养室1 SCD30 SDA引脚
+#define SCD30_SCL_PIN_1 9    // 培养室1 SCD30 SCL引脚
+#define SOIL_SENSOR_PIN 1    // 土壤湿度传感器AO引脚
+#define FAN_RELAY_PIN 14    // 第一个通风风扇继电器控制引脚 (低电平触发)
+#define FAN2_RELAY_PIN 13  // 第二个通风风扇继电器控制引脚 (低电平触发)
+#define ENV_FAN_RELAY_PIN 7  // 环境风扇继电器控制引脚 (低电平触发)
+#define COOLER_RELAY_PIN 12 // 制冷系统继电器控制引脚 (低电平触发)
+#define LIGHT_RELAY_PIN 18  // 照明系统继电器控制引脚 (低电平触发)
+#define MIST_RELAY_PIN 17   // 雾化器继电器控制引脚 (低电平触发)
+
+// 培养室2 SCD30传感器配置
+#define SCD30_SDA_PIN_2 5    // 培养室2 SCD30 SDA引脚
+#define SCD30_SCL_PIN_2 6    // 培养室2 SCD30 SCL引脚
+
+// 培养室3 SCD30传感器配置 (与培养室2共享I2C1总线，分时使用)
+#define SCD30_SDA_PIN_3 10   // 培养室3 SCD30 SDA引脚
+#define SCD30_SCL_PIN_3 11   // 培养室3 SCD30 SCL引脚
+
+// 土壤湿度传感器参数
+const int DRY_VALUE = 4095;    
+const int WET_VALUE = 2000;
+
+// 传感器初始化超时配置
+const unsigned long SENSOR_INIT_TIMEOUT = 5000;
+const unsigned long SENSOR_READ_TIMEOUT = 3000;
+
+// 风扇控制参数
+const float HUMIDITY_FAN_ON = 90.0;
+const float HUMIDITY_FAN_OFF = 85.0;
+const unsigned long FAN_MIN_ON_TIME = 30000;
+const unsigned long FAN_MIN_OFF_TIME = 60000;
+const unsigned long FAN_MAX_ON_TIME = 300000;
+
+// 环境风扇控制参数
+const float ENV_FAN_TEMP_ON = 26.0;     // 温度超过26°C开启环境风扇
+const float ENV_FAN_TEMP_OFF = 24.0;    // 温度低于24°C关闭环境风扇
+const float ENV_FAN_CO2_ON = 1000.0;    // CO2超过1000ppm开启环境风扇
+const float ENV_FAN_CO2_OFF = 800.0;    // CO2低于800ppm关闭环境风扇
+const unsigned long ENV_FAN_MIN_ON_TIME = 30000;   // 最小开启时间30秒
+const unsigned long ENV_FAN_MIN_OFF_TIME = 60000;  // 最小关闭时间1分钟
+const unsigned long ENV_FAN_MAX_ON_TIME = 300000;  // 最大开启时间5分钟
+
+// 制冷系统控制参数
+const float COOLER_TEMP_ON = 28.0;    // 温度超过28°C开启制冷
+const float COOLER_TEMP_OFF = 24.0;   // 温度低于24°C关闭制冷
+const unsigned long COOLER_MIN_ON_TIME = 60000;  // 最小开启时间1分钟
+const unsigned long COOLER_MIN_OFF_TIME = 120000; // 最小关闭时间2分钟
+const unsigned long COOLER_MAX_ON_TIME = 600000;  // 最大开启时间10分钟
+
+// 照明系统控制参数
+const unsigned long LIGHT_ON_TIME = 12 * 60 * 60 * 1000; // 开启时间12小时（毫秒）
+const unsigned long LIGHT_OFF_TIME = 12 * 60 * 60 * 1000; // 关闭时间12小时（毫秒）
+const unsigned long LIGHT_CURRENT_TIME_OFFSET = 6 * 60 * 60 * 1000; // 时间偏移量，调整开关时间
+
+// 雾化器控制参数
+const float MIST_HUMIDITY_THRESHOLD = 75.0;  // 湿度低于75%时开启雾化器
+const float MIST_HUMIDITY_STOP = 85.0;       // 湿度达到85%时停止雾化器
+const unsigned long MIST_MIN_ON_TIME = 60000;   // 最小开启时间1分钟
+const unsigned long MIST_MIN_OFF_TIME = 180000; // 最小关闭时间3分钟
+const unsigned long MIST_MAX_ON_TIME = 300000;  // 最大开启时间5分钟
+
+// 策略管理数据结构
+struct Strategy {
+  String name;
+  String trigger_room;         // "room1", "room2", "room3"
+  String trigger_type;        // "temperature", "humidity", "co2", "time"
+  float trigger_threshold;     // 触发阈值
+  String trigger_operator;    // ">", "<", ">=", "<=", "=="
+  String target_device;       // 目标设备 "fan1", "fan2", "env_fan", "cooler", "light", "mist"
+  String action;             // "on", "off"
+  bool enabled;              // 是否启用
+  unsigned long last_triggered; // 上次触发时间
+};
+
+// 系统运行时间统计
+unsigned long system_start_time = 0;
+
+#define MAX_STRATEGIES 20
+Strategy strategies[MAX_STRATEGIES];
+int strategy_count = 0;
+
+// AI识别数据超时时间（毫秒）
+const unsigned long AI_DATA_TIMEOUT = 30000; // 30秒无数据则认为超时
+
+// ESP-NOW数据结构体（必须与ESP32-CAM端一致）
+typedef struct {
+  char device_id[32];
+  unsigned long timestamp;
+  char stage[32];
+  float confidence;
+  char health[16];
+  float health_confidence;
+  char camera_model[16];
+  char firmware_version[16];
+  int wifi_rssi;
+  unsigned long free_heap;
+  unsigned long uptime_ms;
+} esp_now_mushroom_data_t;
+
+SCD30 scd30_room1;      // 培养室1 SCD30传感器
+SCD30 scd30_room2;      // 培养室2 SCD30传感器
+SCD30 scd30_room3;      // 培养室3 SCD30传感器
+TwoWire I2C_SCD30_1 = TwoWire(0);  // 培养室1 I2C总线 (独立)
+TwoWire I2C_SCD30_2 = TwoWire(1);  // 培养室2和3共享的I2C总线 (分时使用)
+
+// 传感器初始化状态标志
+bool scd30_room1_available = false;
+bool scd30_room2_available = false;
+bool scd30_room3_available = false;
+bool soil_available = true;
+
+// 第一个风扇控制状态
+bool fan_running = false;
+bool fan_manual_mode = true;  // 【修改】默认手动模式
+bool fan_manual_state = false;
+unsigned long fan_last_change_time = 0;
+unsigned long fan_start_time = 0;
+String fan_control_reason = "系统启动";
+
+// 第二个风扇控制状态
+bool fan2_running = false;
+bool fan2_manual_mode = true;  // 【修改】默认手动模式
+bool fan2_manual_state = false;
+unsigned long fan2_last_change_time = 0;
+unsigned long fan2_start_time = 0;
+String fan2_control_reason = "系统启动";
+
+// 环境风扇控制状态
+bool env_fan_running = false;
+bool env_fan_manual_mode = true;  // 【修改】默认手动模式
+bool env_fan_manual_state = false;
+unsigned long env_fan_last_change_time = 0;
+unsigned long env_fan_start_time = 0;
+String env_fan_control_reason = "系统启动";
+
+// 制冷系统控制状态
+bool cooler_running = false;
+bool cooler_manual_mode = true;  // 【修改】默认手动模式
+bool cooler_manual_state = false;
+unsigned long cooler_last_change_time = 0;
+unsigned long cooler_start_time = 0;
+String cooler_control_reason = "系统启动";
+
+// 照明系统控制状态
+bool light_running = false;
+bool light_manual_mode = true;  // 【修改】默认手动模式
+bool light_manual_state = false;
+unsigned long light_last_change_time = 0;
+unsigned long light_start_time = 0;
+String light_control_reason = "系统启动";
+unsigned long light_cycle_start_time = 0;
+
+// 雾化器控制状态
+bool mist_running = false;
+bool mist_manual_mode = true;  // 【修改】默认手动模式
+bool mist_manual_state = false;
+unsigned long mist_last_change_time = 0;
+unsigned long mist_start_time = 0;
+String mist_control_reason = "系统启动";
+
+// AI识别结果数据结构体
+struct AIRecognitionData {
+  String device_id;
+  unsigned long timestamp;
+  String stage;
+  float confidence;
+  String health;
+  float health_confidence;
+  String camera_model;
+  String firmware_version;
+  int wifi_rssi;
+  unsigned long free_heap;
+  unsigned long uptime_ms;
+  bool has_data;
+  unsigned long last_update_time;
+};
+
+// 分时读取控制变量
+bool readRoom2Next = true; // 控制培养室2和3交替读取的全局变量
+
+// 最新AI识别结果
+AIRecognitionData latestMushroomStatus = {
+  "未知",
+  0,
+  "等待数据...",
+  0.0,
+  "未知",
+  0.0,
+  "未知",
+  "未知",
+  0,
+  0,
+  0,
+  false,
+  0
+};
+
+// 蘑菇生长阶段枚举
+enum GrowthStage {
+  SPORE_GERMINATION,
+  FRUITING_INDUCTION
+};
+
+// 蘑菇品种生长参数结构体
+struct MushroomParams {
+  String name;
+  float temp_stage1;
+  float hum_stage1;
+  float temp_stage2;
+  float hum_stage2;
+  String light_requirements;
+  String notes;
+};
+
+// 温湿度数据结构体
+struct SensorData {
+  float temperature;
+  float humidity;
+  float co2;
+  float soil_moisture;
+  unsigned long timestamp;
+};
+
+// SCD30数据结构体
+struct SCD30Data {
+  float temperature;
+  float humidity;
+  int co2;
+  unsigned long timestamp;
+};
+
+// 安全读取结果结构体
+struct SafeReadResult {
+  float temperature;
+  float humidity;
+  bool success;
+};
+
+// 预设蘑菇品种参数
+const int NUM_PRESETS = 5;
+MushroomParams mushroomPresets[NUM_PRESETS] = {
+  {"Orissa奥里萨邦", 26.0, 75.0, 23.0, 90.0, "无需光", "保持恒温促进菌丝爬满"},
+  {"TTBVI", 26.0, 70.0, 23.0, 90.0, "黑暗或弱光", "保湿+通风最关键"},
+  {"Bluey Vuitton", 26.0, 75.0, 23.0, 90.0, "无需光", "保持恒温促进菌丝爬满"},
+  {"杏鲍菇", 26.0, 75.0, 16.0, 85.0, "弱光（12/12周期）", "保湿+通风最关键"},
+  {"双孢菇", 26.0, 80.0, 15.0, 90.0, "弱光（12/12周期）", "保湿+通风最关键"}
+};
+
+// 当前蘑菇品种参数和生长阶段
+MushroomParams room_params = mushroomPresets[0];
+GrowthStage room_stage = SPORE_GERMINATION;
+
+SensorData room_data;         // 培养室1数据 (SCD30)
+SCD30Data room2_scd30_data = {-999, -999, -1, 0};  // 培养室2数据 (SCD30)
+SCD30Data room3_scd30_data = {-999, -999, -1, 0};  // 培养室3数据 (SCD30)
+
+// Web服务器
+WebServer server(80);
+
+// 历史数���存储
+const int HISTORY_SIZE = 50;
+SensorData room_history[HISTORY_SIZE];           // 培养室1历史数据 (SCD30)
+SCD30Data room2_scd30_history[HISTORY_SIZE];    // 培养室2历史数据 (SCD30)
+SCD30Data room3_scd30_history[HISTORY_SIZE];    // 培养室3历史数据 (SCD30)
+int history_index = 0;
+
+// 【修正】ESP-NOW接收回调函数 - 使用正确的参数类型
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
+  Serial.println("=== 收到ESP-NOW数据 ===");
+  Serial.printf("来自MAC地址: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2], 
+                recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+  Serial.printf("数据长度: %d 字节\n", len);
+  
+  if (len == sizeof(esp_now_mushroom_data_t)) {
+    esp_now_mushroom_data_t receivedData;
+    memcpy(&receivedData, incomingData, sizeof(receivedData));
+    
+    // 更新AI识别数据
+    latestMushroomStatus.device_id = String(receivedData.device_id);
+    latestMushroomStatus.timestamp = receivedData.timestamp;
+    latestMushroomStatus.stage = String(receivedData.stage);
+    latestMushroomStatus.confidence = receivedData.confidence;
+    latestMushroomStatus.health = String(receivedData.health);
+    latestMushroomStatus.health_confidence = receivedData.health_confidence;
+    latestMushroomStatus.camera_model = String(receivedData.camera_model);
+    latestMushroomStatus.firmware_version = String(receivedData.firmware_version);
+    latestMushroomStatus.wifi_rssi = receivedData.wifi_rssi;
+    latestMushroomStatus.free_heap = receivedData.free_heap;
+    latestMushroomStatus.uptime_ms = receivedData.uptime_ms;
+    latestMushroomStatus.has_data = true;
+    latestMushroomStatus.last_update_time = millis();
+    
+    Serial.println("✓ AI识别数据更新成功");
+    Serial.printf("设备ID: %s\n", receivedData.device_id);
+    Serial.printf("识别阶段: %s\n", receivedData.stage);
+    Serial.printf("置信度: %.1f%%\n", receivedData.confidence * 100);
+    Serial.printf("健康状况: %s\n", receivedData.health);
+    Serial.printf("摄像头型号: %s\n", receivedData.camera_model);
+    Serial.printf("固件版本: %s\n", receivedData.firmware_version);
+    Serial.printf("WiFi信号: %d dBm\n", receivedData.wifi_rssi);
+    Serial.printf("可用内存: %lu 字节\n", receivedData.free_heap);
+    Serial.printf("运行时间: %lu 毫秒\n", receivedData.uptime_ms);
+  } else {
+    Serial.printf("✗ 数据长度不匹配，期望 %d 字节，收到 %d 字节\n", 
+                  sizeof(esp_now_mushroom_data_t), len);
+  }
+}
+
+// 初始化ESP-NOW
+bool initESPNow() {
+  Serial.println("初始化ESP-NOW...");
+  
+  // 设置WiFi为STA+AP模式，以便同时支持ESP-NOW和WiFi连接
+  WiFi.mode(WIFI_AP_STA);
+  
+  // 打印本机MAC地址
+  Serial.print("本机MAC地址: ");
+  Serial.println(WiFi.macAddress());
+  
+  // 初始化ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("✗ ESP-NOW初始化失败");
+    return false;
+  }
+  
+  // 注册接收回调函数
+  esp_now_register_recv_cb(OnDataRecv);
+  
+  Serial.println("✓ ESP-NOW初始化成功");
+  Serial.println("等待ESP32-CAM连接...");
+  
+  return true;
+}
+
+// 函数声明
+bool initSCD30Room1();
+bool initSCD30Room2();
+bool initSCD30Room3();
+void updateSensorData();
+void updateSCD30Room1Data();
+void updateSCD30Room2Data();
+void updateSCD30Room3Data();
+void switchToRoom2();
+void switchToRoom3();
+void printMonitorInfo();
+float readSoilMoisture();
+void initFanControl();
+void updateFanControl();
+void updateFan2Control();
+void updateEnvFanControl();
+void updateCoolerControl();
+void updateLightControl();
+void updateMistControl();
+void setFanState(bool state, String reason);
+void setFan2State(bool state, String reason);
+void setEnvFanState(bool state, String reason);
+void setCoolerState(bool state, String reason);
+void setLightState(bool state, String reason);
+void setMistState(bool state, String reason);
+bool shouldFanRun();
+bool shouldFan2Run();
+bool shouldEnvFanRun();
+bool shouldCoolerRun();
+bool shouldLightRun();
+bool shouldMistRun();
+String getFanStatusText();
+String getFan2StatusText();
+String getEnvFanStatusText();
+String getCoolerStatusText();
+String getLightStatusText();
+String getMistStatusText();
+String formatUptime(unsigned long milliseconds);
+void handleCORS();
+void handleData();
+void handleHistory();
+void handlePresets();
+void handleUpdateSettings();
+void handleFanStatus();
+void handleFan2Status();
+void handleEnvFanStatus();
+void handleCoolerStatus();
+void handleLightStatus();
+void handleMistStatus();
+void handleFanControl();
+void handleFan2Control();
+void handleEnvFanControl();
+void handleCoolerControl();
+void handleLightControl();
+void handleMistControl();
+void handleGetLatestMushroomStatus();
+void printNetworkDiagnostics();
+void checkNetworkStatus();
+void checkAIDataTimeout();
+void handleStrategies();
+void handleAddStrategy();
+void handleUpdateStrategy();
+void handleDeleteStrategy();
+void initDefaultStrategies();
+void checkAndExecuteStrategies();
+bool evaluateStrategyCondition(const Strategy& strategy);
+void executeStrategyAction(const Strategy& strategy);
+
+// 获取最新的AI识别数据（HTTP API）
+void handleGetLatestMushroomStatus() {
+  DynamicJsonDocument doc(1024);
+
+  if (latestMushroomStatus.has_data) {
+    doc["device_id"] = latestMushroomStatus.device_id;
+    doc["timestamp"] = latestMushroomStatus.timestamp;
+    doc["stage"] = latestMushroomStatus.stage;
+    doc["confidence"] = latestMushroomStatus.confidence;
+    doc["health"] = latestMushroomStatus.health;
+    doc["health_confidence"] = latestMushroomStatus.health_confidence;
+    doc["camera_model"] = latestMushroomStatus.camera_model;
+    doc["firmware_version"] = latestMushroomStatus.firmware_version;
+    doc["wifi_rssi"] = latestMushroomStatus.wifi_rssi;
+    doc["free_heap"] = latestMushroomStatus.free_heap;
+    doc["uptime_ms"] = latestMushroomStatus.uptime_ms;
+    doc["last_update_time"] = latestMushroomStatus.last_update_time;
+    
+    // 检查数据是否超时
+    unsigned long current_time = millis();
+    bool is_timeout = (current_time - latestMushroomStatus.last_update_time) > AI_DATA_TIMEOUT;
+    doc["is_timeout"] = is_timeout;
+    doc["data_age_seconds"] = (current_time - latestMushroomStatus.last_update_time) / 1000;
+    doc["communication_method"] = "ESP-NOW";
+  } else {
+    doc["device_id"] = "未知";
+    doc["stage"] = "等待数据...";
+    doc["confidence"] = 0.0;
+    doc["health"] = "未知";
+    doc["health_confidence"] = 0.0;
+    doc["camera_model"] = "未连接";
+    doc["firmware_version"] = "未知";
+    doc["wifi_rssi"] = 0;
+    doc["free_heap"] = 0;
+    doc["uptime_ms"] = 0;
+    doc["last_update_time"] = 0;
+    doc["is_timeout"] = true;
+    doc["data_age_seconds"] = 0;
+    doc["communication_method"] = "ESP-NOW";
+  }
+
+  String json;
+  serializeJson(doc, json);
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+// 检查AI数据是否超时
+void checkAIDataTimeout() {
+  if (latestMushroomStatus.has_data) {
+    unsigned long current_time = millis();
+    if ((current_time - latestMushroomStatus.last_update_time) > AI_DATA_TIMEOUT) {
+      static unsigned long last_warning = 0;
+      if (current_time - last_warning > 60000) { // 每分钟最多警告一次
+        Serial.println("⚠️ AI识别数据超时，可能ESP32CAM已断开ESP-NOW连接");
+        last_warning = current_time;
+      }
+    }
+  }
+}
+
+// 培养室1 SCD30初始化函数
+bool initSCD30Room1() {
+  Serial.println("初始化SCD30传感器（培养室1）...");
+
+  I2C_SCD30_1.begin(SCD30_SDA_PIN_1, SCD30_SCL_PIN_1);
+  I2C_SCD30_1.setClock(50000);
+
+  delay(1000);
+
+  Serial.print("培养室1使用引脚 SDA:");
+  Serial.print(SCD30_SDA_PIN_1);
+  Serial.print(" SCL:");
+  Serial.println(SCD30_SCL_PIN_1);
+
+  Serial.println("扫描培养室1 SCD30 I2C设备...");
+  I2C_SCD30_1.beginTransmission(0x61);
+  byte error = I2C_SCD30_1.endTransmission();
+  if (error != 0) {
+    Serial.print("培养室1 SCD30地址0x61通信错误，错误代码: ");
+    Serial.println(error);
+    return false;
+  }
+  Serial.println("✓ 培养室1 SCD30地址0x61响应正常");
+
+  bool initSuccess = false;
+
+  initSuccess = scd30_room1.begin(I2C_SCD30_1);
+
+  if (!initSuccess) {
+    Serial.println("方法1失败，尝试方法2...");
+    initSuccess = scd30_room1.begin(I2C_SCD30_1, false);
+  }
+
+  if (!initSuccess) {
+    Serial.println("方法2失败，尝试方法3...");
+    initSuccess = scd30_room1.begin(I2C_SCD30_1, true);
+  }
+
+  if (initSuccess) {
+    Serial.println("✓ 培养室1 SCD30初始化成功！");
+
+    uint16_t fwVersion;
+    if (scd30_room1.getFirmwareVersion(&fwVersion)) {
+      Serial.print("培养室1 SCD30固件版本: 0x");
+      Serial.println(fwVersion, HEX);
+    }
+
+    scd30_room1.setMeasurementInterval(2);
+    delay(2000);
+
+    return true;
+  } else {
+    Serial.println("✗ 培养室1 SCD30初始化失败");
+    return false;
+  }
+}
+
+// 培养室2 SCD30初始化函数
+bool initSCD30Room2() {
+  Serial.println("初始化SCD30传感器（培养室2）...");
+
+  I2C_SCD30_2.begin(SCD30_SDA_PIN_2, SCD30_SCL_PIN_2);
+  I2C_SCD30_2.setClock(50000);
+
+  delay(1000);
+
+  Serial.print("培养室2使用引脚 SDA:");
+  Serial.print(SCD30_SDA_PIN_2);
+  Serial.print(" SCL:");
+  Serial.println(SCD30_SCL_PIN_2);
+
+  Serial.println("扫描培养室2 SCD30 I2C设备...");
+  I2C_SCD30_2.beginTransmission(0x61);
+  byte error = I2C_SCD30_2.endTransmission();
+  if (error != 0) {
+    Serial.print("培养室2 SCD30地址0x61通信错误，错误代码: ");
+    Serial.println(error);
+    return false;
+  }
+  Serial.println("✓ 培养室2 SCD30地址0x61响应正常");
+
+  bool initSuccess = false;
+
+  initSuccess = scd30_room2.begin(I2C_SCD30_2);
+
+  if (!initSuccess) {
+    Serial.println("方法1失败，尝试方法2...");
+    initSuccess = scd30_room2.begin(I2C_SCD30_2, false);
+  }
+
+  if (!initSuccess) {
+    Serial.println("方法2失败，尝试方法3...");
+    initSuccess = scd30_room2.begin(I2C_SCD30_2, true);
+  }
+
+  if (initSuccess) {
+    Serial.println("✓ 培养室2 SCD30初始化成功！");
+
+    uint16_t fwVersion;
+    if (scd30_room2.getFirmwareVersion(&fwVersion)) {
+      Serial.print("培养室2 SCD30固件版本: 0x");
+      Serial.println(fwVersion, HEX);
+    }
+
+    scd30_room2.setMeasurementInterval(2);
+    delay(2000);
+
+    return true;
+  } else {
+    Serial.println("✗ 培养室2 SCD30初始化失败");
+    return false;
+  }
+}
+
+void updateSCD30Room1Data() {
+  if (!scd30_room1_available) {
+    return;
+  }
+
+  if (scd30_room1.dataAvailable()) {
+    room_data.co2 = scd30_room1.getCO2();
+    room_data.temperature = scd30_room1.getTemperature();
+    room_data.humidity = scd30_room1.getHumidity();
+    room_data.timestamp = millis();
+
+    Serial.print("培养室1数据读取: T=");
+    Serial.print(room_data.temperature, 1);
+    Serial.print("°C, H=");
+    Serial.print(room_data.humidity, 1);
+    Serial.print("%, CO2=");
+    Serial.print(room_data.co2);
+    Serial.print("ppm, idx=");
+    Serial.println(history_index);
+
+    if (room_data.temperature >= -40 && room_data.temperature <= 85 &&
+        room_data.humidity >= 0 && room_data.humidity <= 100 &&
+        room_data.co2 >= 400 && room_data.co2 <= 50000) {
+
+      room_history[history_index] = room_data;
+      Serial.println("✓ 培养室1数据已写入历史记录");
+    } else {
+      Serial.println("✗ 培养室1数据验证失败，未写入");
+    }
+  }
+}
+
+// 培养室3 SCD30初始化函数 (分时复用I2C1)
+bool initSCD30Room3() {
+  Serial.println("初始化SCD30传感器（培养室3）...");
+
+  // 先停止当前I2C总线
+  I2C_SCD30_2.end();
+  delay(100);
+
+  // 重新初始化到培养室3的引脚
+  I2C_SCD30_2.begin(SCD30_SDA_PIN_3, SCD30_SCL_PIN_3);
+  I2C_SCD30_2.setClock(50000);
+
+  delay(1000);
+
+  Serial.print("培养室3使用引脚 SDA:");
+  Serial.print(SCD30_SDA_PIN_3);
+  Serial.print(" SCL:");
+  Serial.println(SCD30_SCL_PIN_3);
+
+  Serial.println("扫描培养室3 SCD30 I2C设备...");
+  I2C_SCD30_2.beginTransmission(0x61);
+  byte error = I2C_SCD30_2.endTransmission();
+  if (error != 0) {
+    Serial.print("培养室3 SCD30地址0x61通信错误，错误代码: ");
+    Serial.println(error);
+    // 切换回培养室2
+    switchToRoom2();
+    return false;
+  }
+  Serial.println("✓ 培养室3 SCD30地址0x61响应正常");
+
+  bool initSuccess = false;
+
+  initSuccess = scd30_room3.begin(I2C_SCD30_2);
+
+  if (!initSuccess) {
+    Serial.println("方法1失败，尝试方法2...");
+    initSuccess = scd30_room3.begin(I2C_SCD30_2, false);
+  }
+
+  if (!initSuccess) {
+    Serial.println("方法2失败，尝试方法3...");
+    initSuccess = scd30_room3.begin(I2C_SCD30_2, true);
+  }
+
+  if (initSuccess) {
+    Serial.println("✓ 培养室3 SCD30初始化成功！");
+
+    uint16_t fwVersion;
+    if (scd30_room3.getFirmwareVersion(&fwVersion)) {
+      Serial.print("培养室3 SCD30固件版本: 0x");
+      Serial.println(fwVersion, HEX);
+    }
+
+    scd30_room3.setMeasurementInterval(2);
+    delay(2000);
+
+    // 初始化完成后切换回培养室2
+    switchToRoom2();
+
+    return true;
+  } else {
+    Serial.println("✗ 培养室3 SCD30初始化失败");
+    // 切换回培养室2
+    switchToRoom2();
+    return false;
+  }
+}
+
+void updateSCD30Room2Data() {
+  if (!scd30_room2_available) {
+    return;
+  }
+
+  if (scd30_room2.dataAvailable()) {
+    room2_scd30_data.co2 = scd30_room2.getCO2();
+    room2_scd30_data.temperature = scd30_room2.getTemperature();
+    room2_scd30_data.humidity = scd30_room2.getHumidity();
+    room2_scd30_data.timestamp = millis();
+
+    Serial.print("培养室2数据读取: T=");
+    Serial.print(room2_scd30_data.temperature, 1);
+    Serial.print("°C, H=");
+    Serial.print(room2_scd30_data.humidity, 1);
+    Serial.print("%, CO2=");
+    Serial.print(room2_scd30_data.co2);
+    Serial.print("ppm, idx=");
+    Serial.println(history_index);
+
+    if (room2_scd30_data.temperature >= -40 && room2_scd30_data.temperature <= 85 &&
+        room2_scd30_data.humidity >= 0 && room2_scd30_data.humidity <= 100 &&
+        room2_scd30_data.co2 >= 400 && room2_scd30_data.co2 <= 50000) {
+
+      room2_scd30_history[history_index] = room2_scd30_data;
+      Serial.println("✓ 培养室2数据已写入历史记录");
+    } else {
+      Serial.println("✗ 培养室2数据验证失败，未写入");
+    }
+  }
+}
+
+void updateSCD30Room3Data() {
+  if (!scd30_room3_available) {
+    Serial.println("培养室3传感器不可用，跳过读取");
+    return;
+  }
+
+  Serial.println("切换到培养室3 (SDA10, SCL11)...");
+  // 切换到培养室3
+  switchToRoom3();
+
+  delay(200); // 给传感器一些时间稳定
+
+  if (scd30_room3.dataAvailable()) {
+    room3_scd30_data.co2 = scd30_room3.getCO2();
+    room3_scd30_data.temperature = scd30_room3.getTemperature();
+    room3_scd30_data.humidity = scd30_room3.getHumidity();
+    room3_scd30_data.timestamp = millis();
+
+    Serial.print("培养室3原始数据: CO2=");
+    Serial.print(room3_scd30_data.co2);
+    Serial.print("ppm, 温度=");
+    Serial.print(room3_scd30_data.temperature, 1);
+    Serial.print("°C, 湿度=");
+    Serial.print(room3_scd30_data.humidity, 1);
+    Serial.print("%, idx=");
+    Serial.println(history_index);
+
+    if (room3_scd30_data.temperature >= -40 && room3_scd30_data.temperature <= 85 &&
+        room3_scd30_data.humidity >= 0 && room3_scd30_data.humidity <= 100 &&
+        room3_scd30_data.co2 >= 400 && room3_scd30_data.co2 <= 50000) {
+
+      room3_scd30_history[history_index] = room3_scd30_data;
+      Serial.println("✓ 培养室3数据已写入历史记录");
+    } else {
+      Serial.println("✗ 培养室3数据验证失败，未写入");
+    }
+  } else {
+    Serial.println("培养室3数据未就绪");
+  }
+
+  // 切换回培养室2
+  switchToRoom2();
+}
+
+// 切换到培养室2 (SDA5, SCL6)
+void switchToRoom2() {
+  Serial.println("切换到培养室2 (SDA5, SCL6)...");
+  I2C_SCD30_2.end();
+  delay(50);
+  I2C_SCD30_2.begin(SCD30_SDA_PIN_2, SCD30_SCL_PIN_2);
+  I2C_SCD30_2.setClock(50000);
+  delay(100);
+  Serial.println("培养室2切换完成");
+}
+
+// 切换到培养室3 (SDA10, SCL11)
+void switchToRoom3() {
+  Serial.println("切换到培养室3 (SDA10, SCL11)...");
+  I2C_SCD30_2.end();
+  delay(50);
+  I2C_SCD30_2.begin(SCD30_SDA_PIN_3, SCD30_SCL_PIN_3);
+  I2C_SCD30_2.setClock(50000);
+  delay(100);
+  Serial.println("培养室3切换完成");
+}
+
+void setCoolerState(bool state, String reason) {
+  if (cooler_manual_mode) {
+    return;
+  }
+
+  if (state != cooler_running) {
+    unsigned long current_time = millis();
+
+    if (state && (current_time - cooler_last_change_time < COOLER_MIN_OFF_TIME)) {
+      return;
+    }
+    if (!state && (current_time - cooler_last_change_time < COOLER_MIN_ON_TIME)) {
+      return;
+    }
+
+    cooler_running = state;
+    digitalWrite(COOLER_RELAY_PIN, state ? LOW : HIGH);
+    cooler_last_change_time = current_time;
+    cooler_control_reason = reason;
+
+    if (state) {
+      cooler_start_time = current_time;
+    }
+
+    Serial.print("制冷系统状态变更: ");
+    Serial.print(state ? "开启" : "关闭");
+    Serial.print(" (原因: ");
+    Serial.print(reason);
+    Serial.println(")");
+  }
+}
+
+bool shouldCoolerRun() {
+  if (room_data.temperature == -999) {
+    return false;
+  }
+
+  if (cooler_running) {
+    return room_data.temperature > COOLER_TEMP_OFF;
+  } else {
+    return room_data.temperature > COOLER_TEMP_ON;
+  }
+}
+
+String getCoolerStatusText() {
+  String status = cooler_running ? "运行中" : "已停止";
+  String mode = cooler_manual_mode ? "手动模式" : "自动模式";
+  return status + " (" + mode + ")";
+}
+
+void setLightState(bool state, String reason) {
+  if (light_manual_mode) {
+    return;
+  }
+
+  if (state != light_running) {
+    light_running = state;
+    digitalWrite(LIGHT_RELAY_PIN, state ? LOW : HIGH);
+    light_last_change_time = millis();
+    light_control_reason = reason;
+
+    if (state) {
+      light_start_time = millis();
+    }
+
+    Serial.print("照明系统状态变更: ");
+    Serial.print(state ? "开启" : "关闭");
+    Serial.print(" (原因: ");
+    Serial.print(reason);
+    Serial.println(")");
+  }
+}
+
+bool shouldLightRun() {
+  if (light_manual_mode) {
+    return light_manual_state;
+  }
+
+  unsigned long current_time = millis();
+  unsigned long elapsed_cycle_time = (current_time - light_cycle_start_time + LIGHT_CURRENT_TIME_OFFSET) % (LIGHT_ON_TIME + LIGHT_OFF_TIME);
+
+  // 根据周期时间决定是否开启照明
+  return elapsed_cycle_time < LIGHT_ON_TIME;
+}
+
+String getLightStatusText() {
+  String status = light_running ? "开启" : "关闭";
+  String mode = light_manual_mode ? "手动模式" : "自动模式";
+  return status + " (" + mode + ")";
+}
+
+void setMistState(bool state, String reason) {
+  if (mist_manual_mode) {
+    return;
+  }
+
+  if (state != mist_running) {
+    unsigned long current_time = millis();
+
+    if (state && (current_time - mist_last_change_time < MIST_MIN_OFF_TIME)) {
+      return;
+    }
+    if (!state && (current_time - mist_last_change_time < MIST_MIN_ON_TIME)) {
+      return;
+    }
+
+    mist_running = state;
+    digitalWrite(MIST_RELAY_PIN, state ? LOW : HIGH);
+    mist_last_change_time = current_time;
+    mist_control_reason = reason;
+
+    if (state) {
+      mist_start_time = current_time;
+    }
+
+    Serial.print("雾化器状态变更: ");
+    Serial.print(state ? "开启" : "关闭");
+    Serial.print(" (原因: ");
+    Serial.print(reason);
+    Serial.println(")");
+  }
+}
+
+bool shouldMistRun() {
+  if (room_data.humidity == -999) {
+    return false;
+  }
+
+  if (mist_running) {
+    return room_data.humidity < MIST_HUMIDITY_STOP;
+  } else {
+    return room_data.humidity < MIST_HUMIDITY_THRESHOLD;
+  }
+}
+
+String getMistStatusText() {
+  String status = mist_running ? "运行中" : "已停止";
+  String mode = mist_manual_mode ? "手动模式" : "自动模式";
+  return status + " (" + mode + ")";
+}
+
+String formatUptime(unsigned long milliseconds) {
+  unsigned long seconds = milliseconds / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
+  unsigned long days = hours / 24;
+
+  seconds %= 60;
+  minutes %= 60;
+  hours %= 24;
+
+  String uptime = "";
+
+  if (days > 0) {
+    uptime += String(days) + "天 ";
+  }
+  if (hours > 0) {
+    uptime += String(hours) + "小时 ";
+  }
+  if (minutes > 0) {
+    uptime += String(minutes) + "分钟 ";
+  }
+  uptime += String(seconds) + "秒";
+
+  return uptime;
+}
+
+void initFanControl() {
+  // 初始化第一个风扇
+  pinMode(FAN_RELAY_PIN, OUTPUT);
+  digitalWrite(FAN_RELAY_PIN, HIGH);
+  fan_running = false;
+  fan_last_change_time = millis();
+
+  // 初始化第二个风扇
+  pinMode(FAN2_RELAY_PIN, OUTPUT);
+  digitalWrite(FAN2_RELAY_PIN, HIGH);
+  fan2_running = false;
+  fan2_last_change_time = millis();
+
+  // 初始化环境风扇
+  pinMode(ENV_FAN_RELAY_PIN, OUTPUT);
+  digitalWrite(ENV_FAN_RELAY_PIN, HIGH);
+  env_fan_running = false;
+  env_fan_last_change_time = millis();
+
+  // 初始化制冷系统
+  pinMode(COOLER_RELAY_PIN, OUTPUT);
+  digitalWrite(COOLER_RELAY_PIN, HIGH);
+  cooler_running = false;
+  cooler_last_change_time = millis();
+
+  // 初始化照明系统
+  pinMode(LIGHT_RELAY_PIN, OUTPUT);
+  digitalWrite(LIGHT_RELAY_PIN, HIGH);
+  light_running = false;
+  light_last_change_time = millis();
+  light_cycle_start_time = millis(); // 记录照明周期开始时间
+
+  // 初始化雾化器
+  pinMode(MIST_RELAY_PIN, OUTPUT);
+  digitalWrite(MIST_RELAY_PIN, HIGH);
+  mist_running = false;
+  mist_last_change_time = millis();
+
+  Serial.print("初始化通风风扇1控制 (GPIO");
+  Serial.print(FAN_RELAY_PIN);
+  Serial.println(")...");
+
+  Serial.print("初始化通风风扇2控制 (GPIO");
+  Serial.print(FAN2_RELAY_PIN);
+  Serial.println(")...");
+
+  Serial.print("初始化制冷系统控制 (GPIO");
+  Serial.print(COOLER_RELAY_PIN);
+  Serial.println(")...");
+
+  Serial.print("初始化照明系统控制 (GPIO");
+  Serial.print(LIGHT_RELAY_PIN);
+  Serial.println(")...");
+
+  Serial.print("初始化雾化器控制 (GPIO");
+  Serial.print(MIST_RELAY_PIN);
+  Serial.println(")...");
+
+  Serial.println("✓ 风扇、制冷、照明和雾化器继电器初始化完成 (默认关闭)");
+  Serial.println("风扇控制逻辑: 湿度>90%开启, <85%关闭");
+  Serial.println("制冷控制逻辑: 温度>28°C开启, <24°C关闭");
+  Serial.println("照明控制逻辑: 12小时开启/12小时关闭循环");
+  Serial.println("雾化器控制逻辑: 湿度<75%开启, >85%关闭");
+}
+
+void setFanState(bool state, String reason) {
+  if (fan_manual_mode) {
+    return;
+  }
+  
+  if (state != fan_running) {
+    unsigned long current_time = millis();
+    
+    if (state && (current_time - fan_last_change_time < FAN_MIN_OFF_TIME)) {
+      return;
+    }
+    if (!state && (current_time - fan_last_change_time < FAN_MIN_ON_TIME)) {
+      return;
+    }
+    
+    fan_running = state;
+    digitalWrite(FAN_RELAY_PIN, state ? LOW : HIGH);
+    fan_last_change_time = current_time;
+    fan_control_reason = reason;
+    
+    if (state) {
+      fan_start_time = current_time;
+    }
+    
+    Serial.print("风扇1状态变更: ");
+    Serial.print(state ? "开启" : "关闭");
+    Serial.print(" (原因: ");
+    Serial.print(reason);
+    Serial.println(")");
+  }
+}
+
+void setFan2State(bool state, String reason) {
+  if (fan2_manual_mode) {
+    return;
+  }
+
+  if (state != fan2_running) {
+    unsigned long current_time = millis();
+
+    if (state && (current_time - fan2_last_change_time < FAN_MIN_OFF_TIME)) {
+      return;
+    }
+    if (!state && (current_time - fan2_last_change_time < FAN_MIN_ON_TIME)) {
+      return;
+    }
+
+    fan2_running = state;
+    digitalWrite(FAN2_RELAY_PIN, state ? LOW : HIGH);
+    fan2_last_change_time = current_time;
+    fan2_control_reason = reason;
+
+    if (state) {
+      fan2_start_time = current_time;
+    }
+
+    Serial.print("风扇2状态变更: ");
+    Serial.print(state ? "开启" : "关闭");
+    Serial.print(" (原因: ");
+    Serial.print(reason);
+    Serial.println(")");
+  }
+}
+
+void setEnvFanState(bool state, String reason) {
+  if (env_fan_manual_mode) {
+    return;
+  }
+
+  if (state != env_fan_running) {
+    unsigned long current_time = millis();
+
+    if (state && (current_time - env_fan_last_change_time < ENV_FAN_MIN_OFF_TIME)) {
+      return;
+    }
+    if (!state && (current_time - env_fan_last_change_time < ENV_FAN_MIN_ON_TIME)) {
+      return;
+    }
+
+    env_fan_running = state;
+    digitalWrite(ENV_FAN_RELAY_PIN, state ? LOW : HIGH);
+    env_fan_last_change_time = current_time;
+    env_fan_control_reason = reason;
+
+    if (state) {
+      env_fan_start_time = current_time;
+    }
+
+    Serial.print("环境风扇状态变更: ");
+    Serial.print(state ? "开启" : "关闭");
+    Serial.print(" (原因: ");
+    Serial.print(reason);
+    Serial.println(")");
+  }
+}
+
+bool shouldFanRun() {
+  if (room_data.humidity == -999) {
+    return false;
+  }
+
+  if (fan_running) {
+    return room_data.humidity > HUMIDITY_FAN_OFF;
+  } else {
+    return room_data.humidity > HUMIDITY_FAN_ON;
+  }
+}
+
+bool shouldFan2Run() {
+  if (room2_scd30_data.humidity == -999) {
+    return false;
+  }
+
+  if (fan2_running) {
+    return room2_scd30_data.humidity > HUMIDITY_FAN_OFF;
+  } else {
+    return room2_scd30_data.humidity > HUMIDITY_FAN_ON;
+  }
+}
+
+bool shouldEnvFanRun() {
+  // 使用培养室1的数据进行环境风扇控制
+  if (room_data.temperature == -999 || room_data.co2 == -999) {
+    return false;
+  }
+
+  // 检查温度条件
+  bool temp_condition_met = false;
+  if (env_fan_running) {
+    temp_condition_met = room_data.temperature > ENV_FAN_TEMP_OFF;
+  } else {
+    temp_condition_met = room_data.temperature > ENV_FAN_TEMP_ON;
+  }
+
+  // 检查CO2条件
+  bool co2_condition_met = false;
+  if (env_fan_running) {
+    co2_condition_met = room_data.co2 > ENV_FAN_CO2_OFF;
+  } else {
+    co2_condition_met = room_data.co2 > ENV_FAN_CO2_ON;
+  }
+
+  // 任一条件满足就开启风扇
+  return temp_condition_met || co2_condition_met;
+}
+
+void updateFanControl() {
+  if (fan_manual_mode) {
+    bool desired_state = fan_manual_state;
+    if (desired_state != fan_running) {
+      fan_running = desired_state;
+      digitalWrite(FAN_RELAY_PIN, desired_state ? LOW : HIGH);
+      Serial.print("手动模式风扇1: ");
+      Serial.println(desired_state ? "开启" : "关闭");
+    }
+    return;
+  }
+
+  // 自动模式下不执行默认控制逻辑，只由策略管理控制
+  // 设备状态将在策略执行时更新
+}
+
+void updateFan2Control() {
+  if (fan2_manual_mode) {
+    bool desired_state = fan2_manual_state;
+    if (desired_state != fan2_running) {
+      fan2_running = desired_state;
+      digitalWrite(FAN2_RELAY_PIN, desired_state ? LOW : HIGH);
+      Serial.print("手动模式风扇2: ");
+      Serial.println(desired_state ? "开启" : "关闭");
+    }
+    return;
+  }
+
+  // 自动模式下不执行默认控制逻辑，只由策略管理控制
+  // 设备状态将在策略执行时更新
+}
+
+void updateEnvFanControl() {
+  if (env_fan_manual_mode) {
+    bool desired_state = env_fan_manual_state;
+    if (desired_state != env_fan_running) {
+      env_fan_running = desired_state;
+      digitalWrite(ENV_FAN_RELAY_PIN, desired_state ? LOW : HIGH);
+      Serial.print("手动模式环境风扇: ");
+      Serial.println(desired_state ? "开启" : "关闭");
+    }
+    return;
+  }
+
+  // 自动模式下不执行默认控制逻辑，只由策略管理控制
+  // 设备状态将在策略执行时更新
+}
+
+String getFanStatusText() {
+  String status = fan_running ? "运行中" : "已停止";
+  String mode = fan_manual_mode ? "手动模式" : "自动模式";
+  return status + " (" + mode + ")";
+}
+
+String getFan2StatusText() {
+  String status = fan2_running ? "运行中" : "已停止";
+  String mode = fan2_manual_mode ? "手动模式" : "自动模式";
+  return status + " (" + mode + ")";
+}
+
+String getEnvFanStatusText() {
+  String status = env_fan_running ? "运行中" : "已停止";
+  String mode = env_fan_manual_mode ? "手动模式" : "自动模式";
+  return status + " (" + mode + ")";
+}
+
+
+void handleCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  server.sendHeader("Access-Control-Max-Age", "86400");
+  server.send(200, "text/plain", "");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  // 记录系统启动时间
+  system_start_time = millis();
+
+  Serial.println("=====================================");
+  Serial.println("  蘑菇培养室监控系统 ESP32S3");
+  Serial.println("  三培养室+SCD30+双风扇+ESP-NOW");
+  Serial.println("=====================================");
+  
+  initFanControl();
+  
+  Serial.println("开始初始化传感器...");
+
+  // 初始化培养室1 SCD30
+  scd30_room1_available = initSCD30Room1();
+
+  if (scd30_room1_available) {
+    Serial.println("✓ 培养室1 SCD30初始化成功!");
+  } else {
+    Serial.println("✗ 培养室1 SCD30初始化失败");
+  }
+
+  // 初始化培养室2 SCD30
+  scd30_room2_available = initSCD30Room2();
+
+  if (scd30_room2_available) {
+    Serial.println("✓ 培养室2 SCD30初始化成功!");
+  } else {
+    Serial.println("✗ 培养室2 SCD30初始化失败");
+  }
+
+  // 初始化培养室3 SCD30
+  Serial.println("\n=== 开始初始化培养室3 SCD30 ===");
+  scd30_room3_available = initSCD30Room3();
+
+  if (scd30_room3_available) {
+    Serial.println("✓ 培养室3 SCD30初始化成功!");
+
+    // 测试一次数据读取
+    Serial.println("测试培养室3数据读取...");
+    switchToRoom3();
+    delay(500); // 等待传感器稳定
+
+    if (scd30_room3.dataAvailable()) {
+      float test_co2 = scd30_room3.getCO2();
+      float test_temp = scd30_room3.getTemperature();
+      float test_hum = scd30_room3.getHumidity();
+      Serial.print("测试数据: CO2=");
+      Serial.print(test_co2);
+      Serial.print("ppm, 温度=");
+      Serial.print(test_temp, 1);
+      Serial.print("°C, 湿度=");
+      Serial.print(test_hum, 1);
+      Serial.println("%");
+
+      // 保存测试数据
+      room3_scd30_data.co2 = test_co2;
+      room3_scd30_data.temperature = test_temp;
+      room3_scd30_data.humidity = test_hum;
+      room3_scd30_data.timestamp = millis();
+    } else {
+      Serial.println("测试数据读取失败，数据未就绪");
+    }
+
+    switchToRoom2(); // 切换回培养室2
+  } else {
+    Serial.println("✗ 培养室3 SCD30初始化失败");
+  }
+  
+  Serial.print("初始化土壤湿度传感器 (GPIO");
+  Serial.print(SOIL_SENSOR_PIN);
+  Serial.print(")...");
+  pinMode(SOIL_SENSOR_PIN, INPUT);
+  int testValue = analogRead(SOIL_SENSOR_PIN);
+  if (testValue >= 0 && testValue <= 4095) {
+    soil_available = true;
+    Serial.print(" 成功! 测试读取: ");
+    Serial.println(testValue);
+  } else {
+    soil_available = false;
+    Serial.println(" 失败");
+  }
+  
+  Serial.println("\n=== 传感器初始化总结 ===");
+  Serial.print("SCD30培养室1 (GPIO8/9): ");
+  Serial.println(scd30_room1_available ? "✓ 可用" : "✗ 不可用");
+  Serial.print("SCD30培养室2 (GPIO5/6): ");
+  Serial.println(scd30_room2_available ? "✓ 可用" : "✗ 不可用");
+  Serial.print("SCD30培养室3 (GPIO10/11, 与培养室2分时复用): ");
+  Serial.println(scd30_room3_available ? "✓ 可用" : "✗ 不可用");
+  Serial.print("土壤湿度传感器 (GPIO1): ");
+  Serial.println(soil_available ? "✓ 可用" : "✗ 不可用");
+  Serial.print("通风风扇1继电器 (GPIO14): ");
+  Serial.println("✓ 可用");
+  Serial.print("通风风扇2继电器 (GPIO13): ");
+  Serial.println("✓ 可用");
+  
+  // 初始化ESP-NOW
+  if (!initESPNow()) {
+    Serial.println("✗ ESP-NOW初始化失败!");
+  }
+  
+  Serial.println("\n连接WiFi网络...");
+  WiFi.begin(ssid, password);
+  Serial.print("正在连接");
+
+  int wifiAttempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 20) {
+    delay(500);
+    Serial.print(".");
+    wifiAttempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("✓ WiFi连接成功!");
+    Serial.print("IP地址: ");
+    Serial.println(WiFi.localIP());
+
+    // 创建带IP信息的热点名称
+    String ip = WiFi.localIP().toString();
+    String hotspotName = "ESP32_" + ip;
+    hotspotName.replace(".", "_"); // 替换点号，避免WiFi名称问题
+
+    // 启动AP+STA模式，在热点名称中显示IP
+    WiFi.softAP(hotspotName.c_str(), "12345678");
+    Serial.print("已创建热点: ");
+    Serial.println(hotspotName);
+    Serial.print("热点IP: ");
+    Serial.println(WiFi.softAPIP());
+
+  } else {
+    Serial.println();
+    Serial.println("✗ WiFi连接失败!");
+    WiFi.softAP("ESP32_NoWiFi", "12345678");
+    Serial.println("已创建热点: ESP32_NoWiFi");
+    Serial.print("热点IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+  
+  // 基础API
+  server.on("/", HTTP_GET, [](){
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "text/plain", "ESP32 蘑菇培养室监控系统 API 服务器运行中！使用ESP-NOW通信");
+  });
+  
+  server.on("/api/data", HTTP_GET, handleData);
+  server.on("/api/data", HTTP_OPTIONS, handleCORS);
+  server.on("/api/history", HTTP_GET, handleHistory);
+  server.on("/api/history", HTTP_OPTIONS, handleCORS);
+  server.on("/api/presets", HTTP_GET, handlePresets);
+  server.on("/api/presets", HTTP_OPTIONS, handleCORS);
+  server.on("/api/update-settings", HTTP_POST, handleUpdateSettings);
+  server.on("/api/update-settings", HTTP_OPTIONS, handleCORS);
+  
+  // 风扇控制API
+  server.on("/api/fan/status", HTTP_GET, handleFanStatus);
+  server.on("/api/fan/status", HTTP_OPTIONS, handleCORS);
+  server.on("/api/fan/control", HTTP_POST, handleFanControl);
+  server.on("/api/fan/control", HTTP_OPTIONS, handleCORS);
+  server.on("/api/fan2/status", HTTP_GET, handleFan2Status);
+  server.on("/api/fan2/status", HTTP_OPTIONS, handleCORS);
+  server.on("/api/fan2/control", HTTP_POST, handleFan2Control);
+  server.on("/api/fan2/control", HTTP_OPTIONS, handleCORS);
+  server.on("/api/env_fan/status", HTTP_GET, handleEnvFanStatus);
+  server.on("/api/env_fan/status", HTTP_OPTIONS, handleCORS);
+  server.on("/api/env_fan/control", HTTP_POST, handleEnvFanControl);
+  server.on("/api/env_fan/control", HTTP_OPTIONS, handleCORS);
+
+  // 制冷系统控制API
+  server.on("/api/cooler/status", HTTP_GET, handleCoolerStatus);
+  server.on("/api/cooler/status", HTTP_OPTIONS, handleCORS);
+  server.on("/api/cooler/control", HTTP_POST, handleCoolerControl);
+  server.on("/api/cooler/control", HTTP_OPTIONS, handleCORS);
+
+  // 照明系统控制API
+  server.on("/api/light/status", HTTP_GET, handleLightStatus);
+  server.on("/api/light/status", HTTP_OPTIONS, handleCORS);
+  server.on("/api/light/control", HTTP_POST, handleLightControl);
+  server.on("/api/light/control", HTTP_OPTIONS, handleCORS);
+
+  // 雾化器控制API
+  server.on("/api/mist/status", HTTP_GET, handleMistStatus);
+  server.on("/api/mist/status", HTTP_OPTIONS, handleCORS);
+  server.on("/api/mist/control", HTTP_POST, handleMistControl);
+  server.on("/api/mist/control", HTTP_OPTIONS, handleCORS);
+
+  // 策略管理API
+  server.on("/api/strategies", HTTP_GET, handleStrategies);
+  server.on("/api/strategies", HTTP_OPTIONS, handleCORS);
+  server.on("/api/strategies", HTTP_POST, handleAddStrategy);
+  server.on("/api/strategies", HTTP_OPTIONS, handleCORS);
+  server.on("/api/strategies", HTTP_PUT, handleUpdateStrategy);
+  server.on("/api/strategies", HTTP_OPTIONS, handleCORS);
+  server.on("/api/strategies", HTTP_DELETE, handleDeleteStrategy);
+  server.on("/api/strategies", HTTP_OPTIONS, handleCORS);
+  
+  // AI识别API（ESP-NOW通信）
+  server.on("/api/mushroom-status/latest", HTTP_GET, handleGetLatestMushroomStatus);
+  server.on("/api/mushroom-status/latest", HTTP_OPTIONS, handleCORS);
+  
+  server.on("/status", HTTP_GET, [](){
+    String html = "<!DOCTYPE html><html><head><title>ESP32 Status</title></head><body>";
+    html += "<h1>ESP32 蘑菇培养室监控系统</h1>";
+    html += "<h2>传感器状态</h2>";
+    html += "<p>SCD30培养室1 (GPIO8/9): " + String(scd30_room1_available ? "正常" : "异常") + "</p>";
+    html += "<p>SCD30培养室2 (GPIO5/6): " + String(scd30_room2_available ? "正常" : "异常") + "</p>";
+    html += "<p>SCD30培养室3 (GPIO10/11, 分时复用): " + String(scd30_room3_available ? "正常" : "异常") + "</p>";
+    html += "<p>土壤湿度 (GPIO1): " + String(soil_available ? "正常" : "异常") + "</p>";
+    html += "<p>通风风扇1 (GPIO14): " + getFanStatusText() + "</p>";
+    html += "<p>通风风扇2 (GPIO13): " + getFan2StatusText() + "</p>";
+    html += "<h2>AI识别状态 (ESP-NOW)</h2>";
+    html += "<p>设备ID: " + latestMushroomStatus.device_id + "</p>";
+    html += "<p>识别阶段: " + latestMushroomStatus.stage + "</p>";
+    html += "<p>健康状况: " + latestMushroomStatus.health + "</p>";
+    html += "<p>数据状态: " + String(latestMushroomStatus.has_data ? "有数据" : "无数据") + "</p>";
+    if (latestMushroomStatus.has_data) {
+      unsigned long age = (millis() - latestMushroomStatus.last_update_time) / 1000;
+      html += "<p>数据年龄: " + String(age) + " 秒</p>";
+    }
+    html += "<h2>网络信息</h2>";
+    html += "<p>IP地址: " + WiFi.localIP().toString() + "</p>";
+    html += "<p>信号强度: " + String(WiFi.RSSI()) + " dBm</p>";
+    html += "<p>通信方式: ESP-NOW</p>";
+    if (scd30_room1_available) {
+      html += "<h2>培养室1 SCD30数据</h2>";
+      html += "<p>温度: " + String(room_data.temperature, 1) + " °C</p>";
+      html += "<p>湿度: " + String(room_data.humidity, 1) + " %</p>";
+      html += "<p>CO2: " + String(room_data.co2) + " ppm</p>";
+    }
+    if (scd30_room2_available) {
+      html += "<h2>培养室2 SCD30数据</h2>";
+      html += "<p>温度: " + String(room2_scd30_data.temperature, 1) + " °C</p>";
+      html += "<p>湿度: " + String(room2_scd30_data.humidity, 1) + " %</p>";
+      html += "<p>CO2: " + String(room2_scd30_data.co2) + " ppm</p>";
+    }
+    if (scd30_room3_available) {
+      html += "<h2>培养室3 SCD30数据</h2>";
+      html += "<p>温度: " + String(room3_scd30_data.temperature, 1) + " °C</p>";
+      html += "<p>湿度: " + String(room3_scd30_data.humidity, 1) + " %</p>";
+      html += "<p>CO2: " + String(room3_scd30_data.co2) + " ppm</p>";
+    }
+    html += "<h2>API接口</h2>";
+    html += "<p>数据接口: <a href='/api/data'>/api/data</a></p>";
+    html += "<p>AI识别接口: <a href='/api/mushroom-status/latest'>/api/mushroom-status/latest</a></p>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+  
+  server.begin();
+  Serial.println("\n✓ HTTP API服务器已启动");
+
+  // 初始化默认策略
+  initDefaultStrategies();
+
+  Serial.println("=== ESP-NOW通信已启动 ===");
+  Serial.println("等待ESP32-CAM通过ESP-NOW发送数据...");
+  
+  for (int i = 0; i < HISTORY_SIZE; i++) {
+    // 【修复】初始化为有效数据，timestamp设为1以避免被过滤
+    room_history[i] = {22.0, 75.0, 800.0, 50.0, 1};
+    room2_scd30_history[i] = {22.0, 75.0, 800, 1};
+    room3_scd30_history[i] = {22.0, 75.0, 800, 1};
+  }
+
+  if (scd30_room1_available || soil_available) {
+    Serial.println("\n首次读取传感器数据...");
+    updateSensorData();
+  }
+
+  if (scd30_room2_available) {
+    Serial.println("\n首次读取培养室2 SCD30数据...");
+    updateSCD30Room2Data();
+  }
+
+  printNetworkDiagnostics();
+
+  Serial.println("\n=====================================");
+  Serial.println("    系统初始化完成，开始监控");
+  Serial.println("    等待ESP32CAM通过ESP-NOW发送AI识别数据");
+  Serial.println("=====================================");
+}
+
+void loop() {
+  server.handleClient();
+  
+  static unsigned long lastUpdate = 0;
+  static unsigned long lastPrint = 0;
+  static unsigned long lastNetworkCheck = 0;
+  static unsigned long lastFanUpdate = 0;
+  static unsigned long lastFan2Update = 0;
+  static unsigned long lastEnvFanUpdate = 0;
+  static unsigned long lastCoolerUpdate = 0;
+  static unsigned long lastLightUpdate = 0;
+  static unsigned long lastMistUpdate = 0;
+  static unsigned long lastAICheck = 0;
+
+  // 【修复】现在updateSensorData()内部已包含所有房间的数据更新，统一调用
+  if (millis() - lastUpdate >= 3000) {
+    updateSensorData();
+    lastUpdate = millis();
+  }
+
+  // 【删除】不再需要独立的房间2和3更新，因为已在updateSensorData()中统一处理
+  
+  if (millis() - lastFanUpdate >= 5000) {
+    updateFanControl();
+    lastFanUpdate = millis();
+  }
+  
+  if (millis() - lastFan2Update >= 5000) {
+    updateFan2Control();
+    lastFan2Update = millis();
+  }
+
+  if (millis() - lastEnvFanUpdate >= 5000) {
+    updateEnvFanControl();
+    lastEnvFanUpdate = millis();
+  }
+
+  if (millis() - lastCoolerUpdate >= 5000) {
+    updateCoolerControl();
+    lastCoolerUpdate = millis();
+  }
+
+  if (millis() - lastLightUpdate >= 30000) { // 照明系统每30秒检查一次
+    updateLightControl();
+    lastLightUpdate = millis();
+  }
+
+  if (millis() - lastMistUpdate >= 10000) { // 雾化器每10秒检查一次
+    updateMistControl();
+    lastMistUpdate = millis();
+  }
+
+  // 策略检查 - 每5秒检查一次
+  static unsigned long lastStrategyCheck = 0;
+  if (millis() - lastStrategyCheck >= 5000) {
+    checkAndExecuteStrategies();
+    lastStrategyCheck = millis();
+  }
+  
+  if (millis() - lastPrint >= 10000) {
+    printMonitorInfo();
+    lastPrint = millis();
+  }
+  
+  if (millis() - lastNetworkCheck >= 30000) {
+    checkNetworkStatus();
+    lastNetworkCheck = millis();
+  }
+  
+  if (millis() - lastAICheck >= 10000) {
+    checkAIDataTimeout();
+    lastAICheck = millis();
+  }
+  
+  delay(100);
+}
+
+void printNetworkDiagnostics() {
+  Serial.println("\n=== 网络诊断信息 ===");
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✓ WiFi连接状态: 已连接");
+    Serial.print("✓ IP地址: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("✓ 网关: ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("✓ 子网掩码: ");
+    Serial.println(WiFi.subnetMask());
+    Serial.print("✓ DNS: ");
+    Serial.println(WiFi.dnsIP());
+    Serial.print("✓ 信号强度: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    
+    Serial.println("\n=== API测试地址 ===");
+    Serial.print("数据接口: http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/api/data");
+    Serial.print("状态页面: http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/status");
+    Serial.print("AI识别接口: http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/api/mushroom-status/latest");
+  } else {
+    Serial.println("✗ WiFi连接状态: 未连接");
+  }
+  
+  Serial.println("✓ ESP-NOW通信: 已启用");
+  Serial.println("========================");
+}
+
+void checkNetworkStatus() {
+  static bool wasConnected = false;
+  bool isConnected = (WiFi.status() == WL_CONNECTED);
+  
+  if (isConnected != wasConnected) {
+    if (isConnected) {
+      Serial.println("✓ WiFi重新连接成功");
+      Serial.print("IP地址: ");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("✗ WiFi连接丢失");
+      WiFi.reconnect();
+    }
+    wasConnected = isConnected;
+  }
+}
+
+
+float readSoilMoisture() {
+  if (!soil_available) return -1;
+  
+  long sum = 0;
+  int samples = 5;
+  
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(SOIL_SENSOR_PIN);
+    delay(10);
+  }
+  
+  int avgValue = sum / samples;
+  float moisture = map(avgValue, DRY_VALUE, WET_VALUE, 0, 100);
+  moisture = constrain(moisture, 0, 100);
+  
+  return moisture;
+}
+
+void updateSensorData() {
+  unsigned long currentTime = millis();
+
+  // 【修复】先更新历史索引，避免多个函数访问不同步的索引
+  history_index = (history_index + 1) % HISTORY_SIZE;
+
+  // 更新培养室1 SCD30数据（包含历史记录写入）
+  updateSCD30Room1Data();
+
+  // 【修复】更新培养室2 SCD30数据（包含历史记录写入）
+  if (scd30_room2_available) {
+    updateSCD30Room2Data();
+  }
+
+  // 【修复】更新培养室3 SCD30数据（包含历史记录写入）
+  if (scd30_room3_available) {
+    updateSCD30Room3Data();
+  }
+
+  // 更新土壤湿度数据
+  room_data.soil_moisture = readSoilMoisture();
+  room_data.timestamp = currentTime;
+}
+
+void updateCoolerControl() {
+  if (cooler_manual_mode) {
+    bool desired_state = cooler_manual_state;
+    if (desired_state != cooler_running) {
+      cooler_running = desired_state;
+      digitalWrite(COOLER_RELAY_PIN, desired_state ? LOW : HIGH);
+      Serial.print("手动模式制冷系统: ");
+      Serial.println(desired_state ? "开启" : "关闭");
+    }
+    return;
+  }
+
+  // 自动模式下不执行默认控制逻辑，只由策略管理控制
+  // 设备状态将在策略执行时更新
+}
+
+void updateLightControl() {
+  if (light_manual_mode) {
+    bool desired_state = light_manual_state;
+    if (desired_state != light_running) {
+      light_running = desired_state;
+      digitalWrite(LIGHT_RELAY_PIN, desired_state ? LOW : HIGH);
+      Serial.print("手动模式照明系统: ");
+      Serial.println(desired_state ? "开启" : "关闭");
+    }
+    return;
+  }
+
+  // 自动模式下不执行默认控制逻辑，只由策略管理控制
+  // 设备状态将在策略执行时更新
+}
+
+void updateMistControl() {
+  if (mist_manual_mode) {
+    bool desired_state = mist_manual_state;
+    if (desired_state != mist_running) {
+      mist_running = desired_state;
+      digitalWrite(MIST_RELAY_PIN, desired_state ? LOW : HIGH);
+      Serial.print("手动模式雾化器: ");
+      Serial.println(desired_state ? "开启" : "关闭");
+    }
+    return;
+  }
+
+  // 自动模式下不执行默认控制逻辑，只由策略管理控制
+  // 设备状态将在策略执行时更新
+}
+
+void printMonitorInfo() {
+  Serial.println("=== 监控数据 ===");
+  
+  Serial.print("培养室1(" + room_params.name + "): ");
+  if (room_data.temperature != -999) {
+    Serial.print(room_data.temperature, 1);
+    Serial.print("°C, ");
+  } else {
+    Serial.print("--°C, ");
+  }
+  if (room_data.humidity != -999) {
+    Serial.print(room_data.humidity, 1);
+    Serial.print("%, ");
+  } else {
+    Serial.print("--%,");
+  }
+  if (room_data.co2 != -1) {
+    Serial.print("CO2:");
+    Serial.print(room_data.co2);
+    Serial.print("ppm, ");
+  } else {
+    Serial.print("CO2:--, ");
+  }
+  if (room_data.soil_moisture != -1) {
+    Serial.print("土壤:");
+    Serial.print(room_data.soil_moisture, 1);
+    Serial.print("%, ");
+  } else {
+    Serial.print("土壤:--, ");
+  }
+  Serial.print("风扇1:");
+  Serial.print(fan_running ? "开" : "关");
+  Serial.print("(");
+  Serial.print(fan_manual_mode ? "手动" : "自动");
+  Serial.println(")");
+
+  // 显示制冷系统状态
+  Serial.print("制冷系统:");
+  Serial.print(cooler_running ? "开" : "关");
+  Serial.print("(");
+  Serial.print(cooler_manual_mode ? "手动" : "自动");
+  Serial.print(")");
+  if (room_data.temperature != -999) {
+    Serial.print(" [当前温度:");
+    Serial.print(room_data.temperature, 1);
+    Serial.print("°C]");
+  }
+  Serial.println();
+
+  // 显示照明系统状态
+  Serial.print("照明系统:");
+  Serial.print(light_running ? "开" : "关");
+  Serial.print("(");
+  Serial.print(light_manual_mode ? "手动" : "自动");
+  Serial.print(")");
+
+  if (light_manual_mode) {
+    Serial.print(" [手动控制]");
+  } else {
+    // 计算剩余时间
+    unsigned long current_time = millis();
+    unsigned long elapsed_cycle_time = (current_time - light_cycle_start_time + LIGHT_CURRENT_TIME_OFFSET) % (LIGHT_ON_TIME + LIGHT_OFF_TIME);
+    if (light_running) {
+      unsigned long remaining_on_time = LIGHT_ON_TIME - elapsed_cycle_time;
+      Serial.print(" [剩余开启时间:");
+      Serial.print(remaining_on_time / 1000 / 60);
+      Serial.print("分钟]");
+    } else {
+      unsigned long remaining_off_time = LIGHT_OFF_TIME - (elapsed_cycle_time - LIGHT_ON_TIME);
+      Serial.print(" [剩余关闭时间:");
+      Serial.print(remaining_off_time / 1000 / 60);
+      Serial.print("分钟]");
+    }
+  }
+  Serial.println();
+
+  // 显示雾化器状态
+  Serial.print("雾化器:");
+  Serial.print(mist_running ? "开" : "关");
+  Serial.print("(");
+  Serial.print(mist_manual_mode ? "手动" : "自动");
+  Serial.print(")");
+  if (room_data.humidity != -999) {
+    Serial.print(" [当前湿度:");
+    Serial.print(room_data.humidity, 1);
+    Serial.print("%]");
+  }
+  if (mist_control_reason != "") {
+    Serial.print(" [");
+    Serial.print(mist_control_reason);
+    Serial.print("]");
+  }
+  Serial.println();
+
+  if (scd30_room2_available) {
+    Serial.print("培养室2(SCD30): ");
+    if (room2_scd30_data.temperature != -999) {
+      Serial.print(room2_scd30_data.temperature, 1);
+      Serial.print("°C, ");
+    } else {
+      Serial.print("--°C, ");
+    }
+    if (room2_scd30_data.humidity != -999) {
+      Serial.print(room2_scd30_data.humidity, 1);
+      Serial.print("%, ");
+    } else {
+      Serial.print("--%,");
+    }
+    if (room2_scd30_data.co2 != -1) {
+      Serial.print("CO2:");
+      Serial.print(room2_scd30_data.co2);
+      Serial.print("ppm, ");
+    } else {
+      Serial.print("CO2:--, ");
+    }
+    Serial.print("风扇2:");
+    Serial.print(fan2_running ? "开" : "关");
+    Serial.print("(");
+    Serial.print(fan2_manual_mode ? "手动" : "自动");
+    Serial.print(")");
+    if (readRoom2Next) {
+      Serial.print(" [下次读取培养室3]");
+    }
+    Serial.println();
+  }
+
+  // 始终显示培养室3的状态（无论是否有最新数据）
+  Serial.print("培养室3(SCD30, SDA10/11): ");
+  if (scd30_room3_available) {
+    if (room3_scd30_data.temperature != -999) {
+      Serial.print(room3_scd30_data.temperature, 1);
+      Serial.print("°C, ");
+    } else {
+      Serial.print("--°C, ");
+    }
+    if (room3_scd30_data.humidity != -999) {
+      Serial.print(room3_scd30_data.humidity, 1);
+      Serial.print("%, ");
+    } else {
+      Serial.print("--%,");
+    }
+    if (room3_scd30_data.co2 != -1) {
+      Serial.print("CO2:");
+      Serial.print(room3_scd30_data.co2);
+      Serial.print("ppm");
+    } else {
+      Serial.print("CO2:--");
+    }
+
+    // 显示数据年龄
+    if (room3_scd30_data.timestamp > 0) {
+      unsigned long dataAge = (millis() - room3_scd30_data.timestamp) / 1000;
+      Serial.print(" [数据年龄:");
+      Serial.print(dataAge);
+      Serial.print("秒]");
+    } else {
+      Serial.print(" [无数据]");
+    }
+
+    if (!readRoom2Next) {
+      Serial.print(" [下次读取培养室2]");
+    } else {
+      Serial.print(" [下次读取本室]");
+    }
+  } else {
+    Serial.print("传感器未连接");
+  }
+  Serial.println();
+
+  // 显示AI识别数据状态 (ESP-NOW)
+  if (latestMushroomStatus.has_data) {
+    unsigned long age = (millis() - latestMushroomStatus.last_update_time) / 1000;
+    Serial.print("AI识别[ESP-NOW]: 阶段=");
+    Serial.print(latestMushroomStatus.stage);
+    Serial.print(", 健康=");
+    Serial.print(latestMushroomStatus.health);
+    Serial.print(", 数据年龄=");
+    Serial.print(age);
+    Serial.println("秒");
+  } else {
+    Serial.println("AI识别[ESP-NOW]: 等待ESP32CAM数据...");
+  }
+}
+
+// Web API处理函数
+void handleData() {
+  Serial.println("收到API数据请求");
+  
+  DynamicJsonDocument doc(4096);
+  
+  // 培养室1 - SCD30数据
+  JsonObject room1 = doc.createNestedObject("room1");
+  room1["temperature"] = room_data.temperature;
+  room1["humidity"] = room_data.humidity;
+  room1["co2"] = room_data.co2;
+  room1["soil_moisture"] = room_data.soil_moisture;
+  room1["timestamp"] = room_data.timestamp;
+  room1["name"] = room_params.name;
+  room1["stage"] = room_stage;
+  room1["temp_stage1"] = room_params.temp_stage1;
+  room1["hum_stage1"] = room_params.hum_stage1;
+  room1["temp_stage2"] = room_params.temp_stage2;
+  room1["hum_stage2"] = room_params.hum_stage2;
+  room1["light_requirements"] = room_params.light_requirements;
+  room1["notes"] = room_params.notes;
+  room1["sensor_available"] = scd30_room1_available;
+  room1["soil_available"] = soil_available;
+  room1["co2_available"] = scd30_room1_available;
+  
+  // 风扇1状态信息
+  JsonObject fan = room1.createNestedObject("fan");
+  fan["running"] = fan_running;
+  fan["manual_mode"] = fan_manual_mode;
+  fan["status_text"] = getFanStatusText();
+  fan["control_reason"] = fan_control_reason;
+  fan["runtime_seconds"] = fan_running ? (millis() - fan_start_time) / 1000 : 0;
+
+  // 制冷系统状态信息
+  JsonObject cooler = room1.createNestedObject("cooler");
+  cooler["running"] = cooler_running;
+  cooler["manual_mode"] = cooler_manual_mode;
+  cooler["status_text"] = getCoolerStatusText();
+  cooler["control_reason"] = cooler_control_reason;
+  cooler["runtime_seconds"] = cooler_running ? (millis() - cooler_start_time) / 1000 : 0;
+  cooler["temp_on_threshold"] = COOLER_TEMP_ON;
+  cooler["temp_off_threshold"] = COOLER_TEMP_OFF;
+  cooler["current_temperature"] = room_data.temperature;
+
+  // 照明系统状态信息
+  JsonObject light = room1.createNestedObject("light");
+  light["running"] = light_running;
+  light["manual_mode"] = light_manual_mode;
+  light["status_text"] = getLightStatusText();
+  light["control_reason"] = light_control_reason;
+  light["runtime_seconds"] = light_running ? (millis() - light_start_time) / 1000 : 0;
+
+  // 计算剩余时间
+  unsigned long current_time = millis();
+  unsigned long elapsed_cycle_time = (current_time - light_cycle_start_time + LIGHT_CURRENT_TIME_OFFSET) % (LIGHT_ON_TIME + LIGHT_OFF_TIME);
+  if (light_running) {
+    light["remaining_time_seconds"] = (LIGHT_ON_TIME - elapsed_cycle_time) / 1000;
+    light["next_change_time"] = "关闭";
+  } else {
+    light["remaining_time_seconds"] = (LIGHT_OFF_TIME - (elapsed_cycle_time - LIGHT_ON_TIME)) / 1000;
+    light["next_change_time"] = "开启";
+  }
+  light["cycle_hours"] = LIGHT_ON_TIME / (60 * 60 * 1000);
+
+  // 雾化器状态信息
+  JsonObject mist = room1.createNestedObject("mist");
+  mist["running"] = mist_running;
+  mist["manual_mode"] = mist_manual_mode;
+  mist["status_text"] = getMistStatusText();
+  mist["control_reason"] = mist_control_reason;
+  mist["runtime_seconds"] = mist_running ? (millis() - mist_start_time) / 1000 : 0;
+  mist["humidity_threshold"] = MIST_HUMIDITY_THRESHOLD;
+  mist["humidity_stop"] = MIST_HUMIDITY_STOP;
+  mist["current_humidity"] = room_data.humidity;
+  
+  // 培养室2 - SCD30数据
+  JsonObject room2 = doc.createNestedObject("room2");
+  room2["temperature"] = room2_scd30_data.temperature;
+  room2["humidity"] = room2_scd30_data.humidity;
+  room2["co2"] = room2_scd30_data.co2;
+  room2["soil_moisture"] = -1;
+  room2["timestamp"] = room2_scd30_data.timestamp;
+  room2["name"] = scd30_room2_available ? "培养室2（SCD30）" : "培养室2（SCD30未连接）";
+  room2["stage"] = 0;
+  room2["temp_stage1"] = 26.0;
+  room2["hum_stage1"] = 75.0;
+  room2["temp_stage2"] = 23.0;
+  room2["hum_stage2"] = 90.0;
+  room2["light_requirements"] = scd30_room2_available ? "待设置" : "未设置";
+  room2["notes"] = scd30_room2_available ? "SCD30传感器监控" : "SCD30未连接";
+  room2["sensor_available"] = scd30_room2_available;
+  room2["soil_available"] = false;
+  room2["co2_available"] = scd30_room2_available;
+  
+  // 风扇2状态信息
+  JsonObject fan2 = room2.createNestedObject("fan");
+  fan2["running"] = fan2_running;
+  fan2["manual_mode"] = fan2_manual_mode;
+  fan2["status_text"] = getFan2StatusText();
+  fan2["control_reason"] = fan2_control_reason;
+  fan2["runtime_seconds"] = fan2_running ? (millis() - fan2_start_time) / 1000 : 0;
+  
+  // 培养室3 - SCD30数据
+  JsonObject room3 = doc.createNestedObject("room3");
+  room3["temperature"] = room3_scd30_data.temperature;
+  room3["humidity"] = room3_scd30_data.humidity;
+  room3["soil_moisture"] = -1;
+  room3["co2"] = room3_scd30_data.co2;
+  room3["timestamp"] = room3_scd30_data.timestamp;
+  room3["name"] = scd30_room3_available ? "培养室3（SCD30）" : "培养室3（SCD30未连接）";
+  room3["stage"] = 0;
+  room3["temp_stage1"] = 26.0;
+  room3["hum_stage1"] = 75.0;
+  room3["temp_stage2"] = 23.0;
+  room3["hum_stage2"] = 90.0;
+  room3["light_requirements"] = scd30_room3_available ? "待设置" : "未设置";
+  room3["notes"] = scd30_room3_available ? "SCD30传感器监控" : "SCD30未连接";
+  room3["sensor_available"] = scd30_room3_available;
+  room3["soil_available"] = false;
+  room3["co2_available"] = scd30_room3_available;
+  
+  // 风扇3状态信息（模拟）
+  JsonObject fan3 = room3.createNestedObject("fan");
+  fan3["running"] = false;
+  fan3["manual_mode"] = false;
+  fan3["status_text"] = "未连接";
+  fan3["control_reason"] = "设备未连接";
+  fan3["runtime_seconds"] = 0;
+
+  // 系统信息
+  unsigned long system_uptime = current_time - system_start_time;
+  JsonObject system = doc.createNestedObject("system");
+  system["uptime_ms"] = system_uptime;
+  system["uptime_seconds"] = system_uptime / 1000;
+  system["uptime_formatted"] = formatUptime(system_uptime);
+  system["start_time"] = system_start_time;
+  system["current_time"] = current_time;
+  system["free_heap"] = ESP.getFreeHeap();
+  system["wifi_rssi"] = WiFi.RSSI();
+
+  String json;
+  serializeJson(doc, json);
+  
+  Serial.print("发送JSON数据长度: ");
+  Serial.println(json.length());
+  
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+  
+  Serial.println("API响应已发送");
+}
+
+void handleHistory() {
+  DynamicJsonDocument doc(5120);
+  
+  JsonArray timestamps = doc.createNestedArray("timestamps");
+  JsonArray room1_temp = doc.createNestedArray("room1_temp");
+  JsonArray room1_hum = doc.createNestedArray("room1_hum");
+  JsonArray room1_co2 = doc.createNestedArray("room1_co2");
+  JsonArray room1_soil = doc.createNestedArray("room1_soil");
+  JsonArray room2_temp = doc.createNestedArray("room2_temp");
+  JsonArray room2_hum = doc.createNestedArray("room2_hum");
+  JsonArray room2_co2 = doc.createNestedArray("room2_co2");
+  JsonArray room3_temp = doc.createNestedArray("room3_temp");
+  JsonArray room3_hum = doc.createNestedArray("room3_hum");
+  JsonArray room3_co2 = doc.createNestedArray("room3_co2");
+
+  for (int i = 0; i < HISTORY_SIZE; i++) {
+    // 【修复】生成正确的时间戳
+    // 使用当前Unix时间戳减去已过秒数，生成均匀分布的历史时间
+    unsigned long current_time_seconds = (millis() / 1000);
+    unsigned long time_offset = (HISTORY_SIZE - i - 1) * 3; // 每3秒一个数据点
+    unsigned long timestamp = current_time_seconds - time_offset;
+
+    if (room_history[i].timestamp >= 0) {
+      timestamps.add(timestamp);
+      room1_temp.add(room_history[i].temperature);
+      room1_hum.add(room_history[i].humidity);
+      room1_co2.add(room_history[i].co2);
+      room1_soil.add(room_history[i].soil_moisture);
+      room2_temp.add(room2_scd30_history[i].temperature);
+      room2_hum.add(room2_scd30_history[i].humidity);
+      room2_co2.add(room2_scd30_history[i].co2);
+      room3_temp.add(room3_scd30_history[i].temperature);
+      room3_hum.add(room3_scd30_history[i].humidity);
+      room3_co2.add(room3_scd30_history[i].co2);
+    }
+  }
+  
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handlePresets() {
+  DynamicJsonDocument doc(1024);
+  JsonArray presets = doc.to<JsonArray>();
+  
+  for (int i = 0; i < NUM_PRESETS; i++) {
+    JsonObject preset = presets.createNestedObject();
+    preset["id"] = i;
+    preset["name"] = mushroomPresets[i].name;
+    preset["temp_stage1"] = mushroomPresets[i].temp_stage1;
+    preset["hum_stage1"] = mushroomPresets[i].hum_stage1;
+    preset["temp_stage2"] = mushroomPresets[i].temp_stage2;
+    preset["hum_stage2"] = mushroomPresets[i].hum_stage2;
+    preset["light_requirements"] = mushroomPresets[i].light_requirements;
+    preset["notes"] = mushroomPresets[i].notes;
+  }
+  
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleUpdateSettings() {
+  if (server.method() == HTTP_POST) {
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(512);
+    DeserializationError error = deserializeJson(doc, body);
+    
+    if (error) {
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"JSON解析失败\"}");
+      return;
+    }
+    
+    if (doc.containsKey("room1_preset")) {
+      int preset = doc["room1_preset"];
+      if (preset >= 0 && preset < NUM_PRESETS) {
+        room_params = mushroomPresets[preset];
+        Serial.print("更新培养室1品种为: ");
+        Serial.println(room_params.name);
+      }
+    }
+    if (doc.containsKey("room1_stage")) {
+      room_stage = static_cast<GrowthStage>(doc["room1_stage"].as<int>());
+      Serial.print("更新培养室1生长阶段为: ");
+      Serial.println(room_stage == 0 ? "孢子萌发/菌丝扩展" : "结实诱导（出菇）");
+    }
+    
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", "{\"status\":\"success\"}");
+  } else {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+  }
+}
+
+void handleFanStatus() {
+  DynamicJsonDocument doc(512);
+  doc["running"] = fan_running;
+  doc["manual_mode"] = fan_manual_mode;
+  doc["manual_state"] = fan_manual_state;
+  doc["status_text"] = getFanStatusText();
+  doc["control_reason"] = fan_control_reason;
+  doc["runtime_seconds"] = fan_running ? (millis() - fan_start_time) / 1000 : 0;
+  doc["humidity_fan_on"] = HUMIDITY_FAN_ON;
+  doc["humidity_fan_off"] = HUMIDITY_FAN_OFF;
+  doc["current_humidity"] = room_data.humidity;
+  
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleFan2Status() {
+  DynamicJsonDocument doc(512);
+  doc["running"] = fan2_running;
+  doc["manual_mode"] = fan2_manual_mode;
+  doc["manual_state"] = fan2_manual_state;
+  doc["status_text"] = getFan2StatusText();
+  doc["control_reason"] = fan2_control_reason;
+  doc["runtime_seconds"] = fan2_running ? (millis() - fan2_start_time) / 1000 : 0;
+  doc["humidity_fan_on"] = HUMIDITY_FAN_ON;
+  doc["humidity_fan_off"] = HUMIDITY_FAN_OFF;
+  doc["current_humidity"] = room2_scd30_data.humidity;
+  
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleEnvFanStatus() {
+  DynamicJsonDocument doc(512);
+  doc["running"] = env_fan_running;
+  doc["manual_mode"] = env_fan_manual_mode;
+  doc["manual_state"] = env_fan_manual_state;
+  doc["status_text"] = getEnvFanStatusText();
+  doc["control_reason"] = env_fan_control_reason;
+  doc["runtime_seconds"] = env_fan_running ? (millis() - env_fan_start_time) / 1000 : 0;
+  doc["temp_fan_on"] = ENV_FAN_TEMP_ON;
+  doc["temp_fan_off"] = ENV_FAN_TEMP_OFF;
+  doc["co2_fan_on"] = ENV_FAN_CO2_ON;
+  doc["co2_fan_off"] = ENV_FAN_CO2_OFF;
+  doc["current_temp"] = room_data.temperature;
+  doc["current_co2"] = room_data.co2;
+
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleFanControl() {
+  if (server.method() != HTTP_POST) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+    return;
+  }
+  
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, body);
+  
+  if (error) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"JSON解析失败\"}");
+    return;
+  }
+  
+  String response = "{\"status\":\"success\"}";
+  
+  if (doc.containsKey("mode")) {
+    String mode = doc["mode"];
+    if (mode == "auto") {
+      fan_manual_mode = false;
+      fan_control_reason = "切换到自动模式";
+      Serial.println("风扇1切换到自动模式");
+    } else if (mode == "manual") {
+      fan_manual_mode = true;
+      fan_control_reason = "切换到手动模式";
+      Serial.println("风扇1切换到手动模式");
+    } else {
+      response = "{\"status\":\"error\",\"message\":\"无效的模式\"}";
+    }
+  }
+  
+  if (doc.containsKey("state") && fan_manual_mode) {
+    fan_manual_state = doc["state"];
+    Serial.print("手动设置风扇1状态: ");
+    Serial.println(fan_manual_state ? "开启" : "关闭");
+  }
+  
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", response);
+}
+
+void handleFan2Control() {
+  if (server.method() != HTTP_POST) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+    return;
+  }
+  
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, body);
+  
+  if (error) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"JSON解析失败\"}");
+    return;
+  }
+  
+  String response = "{\"status\":\"success\"}";
+  
+  if (doc.containsKey("mode")) {
+    String mode = doc["mode"];
+    if (mode == "auto") {
+      fan2_manual_mode = false;
+      fan2_control_reason = "切换到自动模式";
+      Serial.println("风扇2切换到自动模式");
+    } else if (mode == "manual") {
+      fan2_manual_mode = true;
+      fan2_control_reason = "切换到手动模式";
+      Serial.println("风扇2切换到手动模式");
+    } else {
+      response = "{\"status\":\"error\",\"message\":\"无效的模式\"}";
+    }
+  }
+  
+  if (doc.containsKey("state") && fan2_manual_mode) {
+    fan2_manual_state = doc["state"];
+    Serial.print("手动设置风扇2状态: ");
+    Serial.println(fan2_manual_state ? "开启" : "关闭");
+  }
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", response);
+}
+
+void handleEnvFanControl() {
+  if (server.method() != HTTP_POST) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+    return;
+  }
+
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"JSON解析失败\"}");
+    return;
+  }
+
+  String response = "{\"status\":\"success\"}";
+
+  if (doc.containsKey("mode")) {
+    String mode = doc["mode"];
+    if (mode == "auto") {
+      env_fan_manual_mode = false;
+      env_fan_control_reason = "切换到自动模式";
+      Serial.println("环境风扇切换到自动模式");
+    } else if (mode == "manual") {
+      env_fan_manual_mode = true;
+      env_fan_control_reason = "切换到手动模式";
+      Serial.println("环境风扇切换到手动模式");
+    } else {
+      response = "{\"status\":\"error\",\"message\":\"无效的模式\"}";
+    }
+  }
+
+  if (doc.containsKey("state") && env_fan_manual_mode) {
+    env_fan_manual_state = doc["state"];
+    Serial.print("手动设置环境风扇状态: ");
+    Serial.println(env_fan_manual_state ? "开启" : "关闭");
+  }
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", response);
+}
+
+void handleCoolerStatus() {
+  DynamicJsonDocument doc(512);
+  doc["running"] = cooler_running;
+  doc["manual_mode"] = cooler_manual_mode;
+  doc["manual_state"] = cooler_manual_state;
+  doc["status_text"] = getCoolerStatusText();
+  doc["control_reason"] = cooler_control_reason;
+  doc["runtime_seconds"] = cooler_running ? (millis() - cooler_start_time) / 1000 : 0;
+  doc["temp_on_threshold"] = COOLER_TEMP_ON;
+  doc["temp_off_threshold"] = COOLER_TEMP_OFF;
+  doc["current_temperature"] = room_data.temperature;
+
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleCoolerControl() {
+  if (server.method() != HTTP_POST) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+    return;
+  }
+
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"JSON解析失败\"}");
+    return;
+  }
+
+  String response = "{\"status\":\"success\"}";
+
+  if (doc.containsKey("mode")) {
+    String mode = doc["mode"];
+    if (mode == "auto") {
+      cooler_manual_mode = false;
+      cooler_control_reason = "切换到自动模式";
+      Serial.println("制冷系统切换到自动模式");
+    } else if (mode == "manual") {
+      cooler_manual_mode = true;
+      cooler_control_reason = "切换到手动模式";
+      Serial.println("制冷系统切换到手动模式");
+    } else {
+      response = "{\"status\":\"error\",\"message\":\"无效的模式\"}";
+    }
+  }
+
+  if (doc.containsKey("state") && cooler_manual_mode) {
+    cooler_manual_state = doc["state"];
+    Serial.print("手动设置制冷系统状态: ");
+    Serial.println(cooler_manual_state ? "开启" : "关闭");
+  }
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", response);
+}
+
+void handleLightStatus() {
+  DynamicJsonDocument doc(512);
+  doc["running"] = light_running;
+  doc["manual_mode"] = light_manual_mode;
+  doc["manual_state"] = light_manual_state;
+  doc["status_text"] = getLightStatusText();
+  doc["control_reason"] = light_control_reason;
+  doc["runtime_seconds"] = light_running ? (millis() - light_start_time) / 1000 : 0;
+
+  // 计算剩余时间
+  unsigned long current_time = millis();
+  unsigned long elapsed_cycle_time = (current_time - light_cycle_start_time + LIGHT_CURRENT_TIME_OFFSET) % (LIGHT_ON_TIME + LIGHT_OFF_TIME);
+  if (light_running) {
+    doc["remaining_time_seconds"] = (LIGHT_ON_TIME - elapsed_cycle_time) / 1000;
+    doc["next_change_time"] = "关闭";
+  } else {
+    doc["remaining_time_seconds"] = (LIGHT_OFF_TIME - (elapsed_cycle_time - LIGHT_ON_TIME)) / 1000;
+    doc["next_change_time"] = "开启";
+  }
+  doc["cycle_hours"] = LIGHT_ON_TIME / (60 * 60 * 1000);
+
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleLightControl() {
+  if (server.method() != HTTP_POST) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+    return;
+  }
+
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"JSON解析失败\"}");
+    return;
+  }
+
+  String response = "{\"status\":\"success\"}";
+
+  if (doc.containsKey("mode")) {
+    String mode = doc["mode"];
+    if (mode == "auto") {
+      light_manual_mode = false;
+      light_control_reason = "切换到自动模式";
+      Serial.println("照明系统切换到自动模式");
+    } else if (mode == "manual") {
+      light_manual_mode = true;
+      light_control_reason = "切换到手动模式";
+      Serial.println("照明系统切换到手动模式");
+    } else {
+      response = "{\"status\":\"error\",\"message\":\"无效的模式\"}";
+    }
+  }
+
+  if (doc.containsKey("state") && light_manual_mode) {
+    light_manual_state = doc["state"];
+    Serial.print("手动设置照明系统状态: ");
+    Serial.println(light_manual_state ? "开启" : "关闭");
+  }
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", response);
+}
+
+void handleMistStatus() {
+  DynamicJsonDocument doc(512);
+  doc["running"] = mist_running;
+  doc["manual_mode"] = mist_manual_mode;
+  doc["manual_state"] = mist_manual_state;
+  doc["status_text"] = getMistStatusText();
+  doc["control_reason"] = mist_control_reason;
+  doc["runtime_seconds"] = mist_running ? (millis() - mist_start_time) / 1000 : 0;
+  doc["humidity_threshold"] = MIST_HUMIDITY_THRESHOLD;
+  doc["humidity_stop"] = MIST_HUMIDITY_STOP;
+  doc["current_humidity"] = room_data.humidity;
+
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleMistControl() {
+  if (server.method() != HTTP_POST) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+    return;
+  }
+
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"JSON解析失败\"}");
+    return;
+  }
+
+  String response = "{\"status\":\"success\"}";
+
+  if (doc.containsKey("mode")) {
+    String mode = doc["mode"];
+    if (mode == "auto") {
+      mist_manual_mode = false;
+      mist_control_reason = "切换到自动模式";
+      Serial.println("雾化器切换到自动模式");
+    } else if (mode == "manual") {
+      mist_manual_mode = true;
+      mist_control_reason = "切换到手动模式";
+      Serial.println("雾化器切换到手动模式");
+    } else {
+      response = "{\"status\":\"error\",\"message\":\"无效的模式\"}";
+    }
+  }
+
+  if (doc.containsKey("state") && mist_manual_mode) {
+    mist_manual_state = doc["state"];
+    Serial.print("手动设置雾化器状态: ");
+    Serial.println(mist_manual_state ? "开启" : "关闭");
+  }
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", response);
+}
+
+// 策略管理函数
+void initDefaultStrategies() {
+  strategy_count = 0;
+
+  // 清空现有策略
+  for (int i = 0; i < MAX_STRATEGIES; i++) {
+    strategies[i] = {"", "", "", 0, "", "", "", false, 0};
+  }
+
+  // 添加默认策略
+  // 策略1: 温度超过28°C开启制冷
+  strategies[0] = {"高温制冷", "room1", "temperature", 28.0, ">", "cooler", "on", true, 0};
+  strategy_count++;
+
+  // 策略2: 温度低于24°C关闭制冷
+  strategies[1] = {"低温关制冷", "room1", "temperature", 24.0, "<", "cooler", "off", true, 0};
+  strategy_count++;
+
+  // 策略3: 湿度超过90%开启风扇1
+  strategies[2] = {"高湿通风1", "room1", "humidity", 90.0, ">", "fan1", "on", true, 0};
+  strategy_count++;
+
+  // 策略4: 湿度低于85%关闭风扇1
+  strategies[3] = {"正常关通风1", "room1", "humidity", 85.0, "<", "fan1", "off", true, 0};
+  strategy_count++;
+
+  // 策略5: 湿度超过90%开启风扇2
+  strategies[4] = {"高湿通风2", "room2", "humidity", 90.0, ">", "fan2", "on", true, 0};
+  strategy_count++;
+
+  // 策略6: 湿度低于85%关闭风扇2
+  strategies[5] = {"正常关通风2", "room2", "humidity", 85.0, "<", "fan2", "off", true, 0};
+  strategy_count++;
+
+  // 策略7: 湿度低于75%开启雾化器
+  strategies[6] = {"低湿加湿", "room1", "humidity", 75.0, "<", "mist", "on", true, 0};
+  strategy_count++;
+
+  // 策略8: 湿度超过85%关闭雾化器
+  strategies[7] = {"高湿停加湿", "room1", "humidity", 85.0, ">", "mist", "off", true, 0};
+  strategy_count++;
+
+  // 策略9: CO2超过1500ppm开启风扇
+  strategies[8] = {"高CO2通风", "room1", "co2", 1500.0, ">", "fan1", "on", true, 0};
+  strategy_count++;
+
+  // 策略10: CO2低于800ppm关闭风扇
+  strategies[9] = {"正常CO2关通风", "room1", "co2", 800.0, "<", "fan1", "off", true, 0};
+  strategy_count++;
+
+  Serial.println("✓ 默认策略已初始化");
+  Serial.print("共加载 ");
+  Serial.print(strategy_count);
+  Serial.println(" 个策略");
+}
+
+void checkAndExecuteStrategies() {
+  unsigned long current_time = millis();
+
+  for (int i = 0; i < strategy_count; i++) {
+    Strategy& strategy = strategies[i];
+
+    if (!strategy.enabled) continue;
+
+    // 防止频繁触发同一策略（至少间隔30秒）
+    if (current_time - strategy.last_triggered < 30000) continue;
+
+    if (evaluateStrategyCondition(strategy)) {
+      executeStrategyAction(strategy);
+      strategy.last_triggered = current_time;
+    }
+  }
+}
+
+bool evaluateStrategyCondition(const Strategy& strategy) {
+  float current_value = 0.0;
+
+  // 根据房间和触发类型获取当前值
+  if (strategy.trigger_room == "room1") {
+    if (strategy.trigger_type == "temperature") {
+      current_value = room_data.temperature;
+    } else if (strategy.trigger_type == "humidity") {
+      current_value = room_data.humidity;
+    } else if (strategy.trigger_type == "co2") {
+      current_value = room_data.co2;
+    } else if (strategy.trigger_type == "soil") {
+      current_value = room_data.soil_moisture;
+    }
+  } else if (strategy.trigger_room == "room2") {
+    if (strategy.trigger_type == "temperature") {
+      current_value = room2_scd30_data.temperature;
+    } else if (strategy.trigger_type == "humidity") {
+      current_value = room2_scd30_data.humidity;
+    } else if (strategy.trigger_type == "co2") {
+      current_value = room2_scd30_data.co2;
+    }
+  } else if (strategy.trigger_room == "room3") {
+    if (strategy.trigger_type == "temperature") {
+      current_value = room3_scd30_data.temperature;
+    } else if (strategy.trigger_type == "humidity") {
+      current_value = room3_scd30_data.humidity;
+    } else if (strategy.trigger_type == "co2") {
+      current_value = room3_scd30_data.co2;
+    }
+  }
+
+  // 检查数据有效性
+  if (current_value == -999 || current_value == -1) {
+    return false;
+  }
+
+  // 评估条件
+  if (strategy.trigger_operator == ">") {
+    return current_value > strategy.trigger_threshold;
+  } else if (strategy.trigger_operator == "<") {
+    return current_value < strategy.trigger_threshold;
+  } else if (strategy.trigger_operator == ">=") {
+    return current_value >= strategy.trigger_threshold;
+  } else if (strategy.trigger_operator == "<=") {
+    return current_value <= strategy.trigger_threshold;
+  } else if (strategy.trigger_operator == "==") {
+    return abs(current_value - strategy.trigger_threshold) < 0.1;
+  }
+
+  return false;
+}
+
+void executeStrategyAction(const Strategy& strategy) {
+  Serial.print("策略触发: ");
+  Serial.print(strategy.name);
+  Serial.print(" -> ");
+  Serial.print(strategy.target_device);
+  Serial.print(" ");
+  Serial.println(strategy.action);
+
+  if (strategy.target_device == "fan1") {
+    bool target_state = (strategy.action == "on");
+    if (!fan_manual_mode) {
+      setFanState(target_state, "策略触发: " + strategy.name);
+    }
+  } else if (strategy.target_device == "fan2") {
+    bool target_state = (strategy.action == "on");
+    if (!fan2_manual_mode) {
+      setFan2State(target_state, "策略触发: " + strategy.name);
+    }
+  } else if (strategy.target_device == "env_fan") {
+    bool target_state = (strategy.action == "on");
+    if (!env_fan_manual_mode) {
+      setEnvFanState(target_state, "策略触发: " + strategy.name);
+    }
+  } else if (strategy.target_device == "cooler") {
+    bool target_state = (strategy.action == "on");
+    if (!cooler_manual_mode) {
+      setCoolerState(target_state, "策略触发: " + strategy.name);
+    }
+  } else if (strategy.target_device == "light") {
+    bool target_state = (strategy.action == "on");
+    if (!light_manual_mode) {
+      setLightState(target_state, "策略触发: " + strategy.name);
+    }
+  } else if (strategy.target_device == "mist") {
+    bool target_state = (strategy.action == "on");
+    if (!mist_manual_mode) {
+      setMistState(target_state, "策略触发: " + strategy.name);
+    }
+  }
+}
+
+// 策略API处理函数
+void handleStrategies() {
+  DynamicJsonDocument doc(1024);
+
+  // 添加status字段
+  doc["status"] = "success";
+  JsonArray strategiesArray = doc.createNestedArray("strategies");
+
+  for (int i = 0; i < strategy_count; i++) {
+    JsonObject strategyObj = strategiesArray.createNestedObject();
+    strategyObj["id"] = i;
+    strategyObj["name"] = strategies[i].name;
+    strategyObj["trigger_room"] = strategies[i].trigger_room;
+    strategyObj["trigger_type"] = strategies[i].trigger_type;
+    strategyObj["trigger_threshold"] = strategies[i].trigger_threshold;
+    strategyObj["trigger_operator"] = strategies[i].trigger_operator;
+    strategyObj["target_device"] = strategies[i].target_device;
+    strategyObj["action"] = strategies[i].action;
+    strategyObj["enabled"] = strategies[i].enabled;
+    strategyObj["last_triggered"] = strategies[i].last_triggered;
+
+    // 计算相对时间差（毫秒）
+    unsigned long current_time = millis();
+    if (strategies[i].last_triggered > 0) {
+      strategyObj["time_since_triggered"] = current_time - strategies[i].last_triggered;
+      strategyObj["triggered_today"] = (current_time - strategies[i].last_triggered) < 24UL * 3600 * 1000;
+    } else {
+      strategyObj["time_since_triggered"] = -1;
+      strategyObj["triggered_today"] = false;
+    }
+  }
+
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleAddStrategy() {
+  if (server.method() != HTTP_POST) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+    return;
+  }
+
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"JSON解析失败\"}");
+    return;
+  }
+
+  if (strategy_count >= MAX_STRATEGIES) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"策略数量已达到上限\"}");
+    return;
+  }
+
+  // 添加新策略
+  strategies[strategy_count].name = doc["name"] | "";
+  strategies[strategy_count].trigger_room = doc["trigger_room"] | "room1";
+  strategies[strategy_count].trigger_type = doc["trigger_type"] | "";
+  strategies[strategy_count].trigger_threshold = doc["trigger_threshold"] | 0.0;
+  strategies[strategy_count].trigger_operator = doc["trigger_operator"] | "";
+  strategies[strategy_count].target_device = doc["target_device"] | "";
+  strategies[strategy_count].action = doc["action"] | "";
+  strategies[strategy_count].enabled = doc["enabled"] | true;
+  strategies[strategy_count].last_triggered = 0;
+
+  strategy_count++;
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"策略添加成功\"}");
+}
+
+void handleUpdateStrategy() {
+  if (server.method() != HTTP_PUT) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+    return;
+  }
+
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error || !doc.containsKey("id")) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"请求格式错误\"}");
+    return;
+  }
+
+  int strategy_id = doc["id"];
+  if (strategy_id < 0 || strategy_id >= strategy_count) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"策略不存在\"}");
+    return;
+  }
+
+  // 更新策略
+  if (doc.containsKey("name")) strategies[strategy_id].name = doc["name"] | strategies[strategy_id].name;
+  if (doc.containsKey("trigger_type")) strategies[strategy_id].trigger_type = doc["trigger_type"] | strategies[strategy_id].trigger_type;
+  if (doc.containsKey("trigger_threshold")) strategies[strategy_id].trigger_threshold = doc["trigger_threshold"] | strategies[strategy_id].trigger_threshold;
+  if (doc.containsKey("trigger_operator")) strategies[strategy_id].trigger_operator = doc["trigger_operator"] | strategies[strategy_id].trigger_operator;
+  if (doc.containsKey("target_device")) strategies[strategy_id].target_device = doc["target_device"] | strategies[strategy_id].target_device;
+  if (doc.containsKey("action")) strategies[strategy_id].action = doc["action"] | strategies[strategy_id].action;
+  if (doc.containsKey("enabled")) strategies[strategy_id].enabled = doc["enabled"] | strategies[strategy_id].enabled;
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"策略更新成功\"}");
+}
+
+void handleDeleteStrategy() {
+  if (server.method() != HTTP_DELETE) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(405, "text/plain", "方法不允许");
+    return;
+  }
+
+  String idParam = server.arg("id");
+  int strategy_id = idParam.toInt();
+
+  if (strategy_id < 0 || strategy_id >= strategy_count) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"策略不存在\"}");
+    return;
+  }
+
+  // 删除策略（通过移位）
+  for (int i = strategy_id; i < strategy_count - 1; i++) {
+    strategies[i] = strategies[i + 1];
+  }
+  strategy_count--;
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"策略删除成功\"}");
+}
